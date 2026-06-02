@@ -15,7 +15,7 @@ from hotel_env import (
 
 LOG_DIR = "./logs/ppo/" #tensorboard logs for PPO training
 DQN_LOG_DIR = "./logs/dqn/" #tensorboard logs for DQN training
-TOTAL_TIMESTEPS = 20_000 
+TOTAL_TIMESTEPS = 50_000 
 N_EVAL_EPISODES = 30
 
 # =========check to perivallon==============
@@ -251,7 +251,7 @@ if __name__ == "__main__":
     print()
 
     verify()
-    #model = train_ppo()
-    model = train_dqn()  # DQN
+    #model = train_ppo() #runs with PPO
+    model = train_dqn()  #runs with DQN
     results = compare(model)
     plot(results)
