@@ -1,5 +1,5 @@
 logs/
-_pycache__/
+__pycache__/
 .vscode/
 intellirate_dqn.zip
 intellirate_ppo.zip
