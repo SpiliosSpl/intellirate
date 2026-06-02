@@ -64,7 +64,7 @@ class HotelEnv(gym.Env):
 
         self.current_month = int(self.np_random.integers(5, 8))
 
-        # Randomise starting occupancy (10–35%)
+        # Randomise starting occupancy 
         self.occupancy = float(np.clip(
             self.np_random.normal(0.20, 0.10), 0.0, 1.0
         ))
@@ -87,7 +87,7 @@ class HotelEnv(gym.Env):
         rooms_booked = min(available,
                            booked * float(self.np_random.integers(1, TOTAL_ROOMS + 1)))
 
-        #RevPAR reward
+        #RevPAR reward (simulated per room)
         daily_revenue = actual_price * rooms_booked
         reward = daily_revenue / TOTAL_ROOMS
 

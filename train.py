@@ -14,7 +14,7 @@ from hotel_env import (
 )
 
 LOG_DIR = "./logs/ppo/" #tensorboard logs for PPO training
-DQN_LOG_DIR = "./logs/dqn/" #tensorboard logs for DQN training
+#DQN_LOG_DIR = "./logs/dqn/" #tensorboard logs for DQN training
 TOTAL_TIMESTEPS = 50_000 
 N_EVAL_EPISODES = 30
 
@@ -43,44 +43,6 @@ def verify():
     env.close()
     print()
 #================================================
-
-
-#===========DQN training=============================
-def train_dqn():
-    print("=" * 58)
-    print("2) --- Train DQN ---")
-    print("=" * 58)
-    print(f"  TensorBoard: tensorboard --logdir {DQN_LOG_DIR}")
-    print()
-
-    os.makedirs(DQN_LOG_DIR, exist_ok=True)
-    env = Monitor(HotelEnv(), DQN_LOG_DIR)
-
-    model = DQN(
-        "MlpPolicy",
-        env,
-        learning_rate=1e-4,
-        buffer_size=50_000,
-        learning_starts=1_000,
-        batch_size=64,
-        gamma=0.99,
-        train_freq=4,
-        target_update_interval=500,
-        exploration_fraction=0.2,
-        exploration_final_eps=0.05,
-        verbose=1,
-        tensorboard_log=DQN_LOG_DIR,
-        seed=42,
-        device="cpu",
-    )
-
-    model.learn(total_timesteps=TOTAL_TIMESTEPS)
-    model.save("intellirate_dqn")
-    env.close()
-
-    print("\n ! Model saved: intellirate_dqn.zip\n")
-    return model
-#====================================================
 
 
 # ==========PPO training=============================
@@ -167,7 +129,7 @@ def compare(model):
     results = {
         "Fixed price (1.00x)": (fixed_m, fixed_s, 0.0),
         "Rule-based": (rule_m,  rule_s,  rule_imp),
-        "RL model (DQN / PPO)": (rl_m,   rl_s,   rl_imp),
+        "RL model (PPO)": (rl_m,   rl_s,   rl_imp),
     }
 
     # Print results table
@@ -202,7 +164,7 @@ def plot(results, path="learning_curve.png"):
 
         # Raw faint color + smoothed rl curve
         ax.plot(x,    y,    alpha=0.15, color="#2E75B6", linewidth=0.8)
-        ax.plot(x_sm, y_sm, color="#2E75B6", linewidth=2.2, label="RL model (DQN / PPO)")
+        ax.plot(x_sm, y_sm, color="#2E75B6", linewidth=2.2, label="RL model (PPO)")
 
         # Baseline horizontal reference lines
         fixed_m = results["Fixed price (1.00x)"][0]
@@ -251,7 +213,7 @@ if __name__ == "__main__":
     print()
 
     verify()
-    #model = train_ppo() #runs with PPO
-    model = train_dqn()  #runs with DQN
+    model = train_ppo() #runs with PPO
+    #model = train_dqn()  #runs with DQN
     results = compare(model)
     plot(results)
