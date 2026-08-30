@@ -4,3 +4,7 @@ __pycache__/
 intellirate_dqn.zip
 intellirate_ppo.zip
 learning_curve.png
+hotel_booking.csv
+demand_features.pkl
+demand_model.pkl
+demand_validation.png

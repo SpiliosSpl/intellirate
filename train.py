@@ -9,13 +9,16 @@ from stable_baselines3.common.results_plotter import load_results, ts2xy
 
 from hotel_env import (
     HotelEnv, BASE_ADR, TOTAL_ROOMS,
-    PRICE_MULTIPLIERS, SEASONALITY,
-    DAY_MULTIPLIERS, OCCUPANCY_BOOST_WEIGHT,
+    PRICE_MULTIPLIERS, OCCUPANCY_BOOST_WEIGHT,
+    DEMAND_MODEL_PATH, DEMAND_FEATURES_PATH,
 )
+# NOTE: SEASONALITY and DAY_MULTIPLIERS are gone — the Logistic Regression
+# demand model already learned seasonal + weekend patterns from the real
+# Kaggle data, so they are no longer separate config values.
 
 LOG_DIR = "./logs/ppo/" #tensorboard logs for PPO training
 #DQN_LOG_DIR = "./logs/dqn/" #tensorboard logs for DQN training
-TOTAL_TIMESTEPS = 50_000 
+TOTAL_TIMESTEPS = 50_000
 N_EVAL_EPISODES = 30
 
 # =========check to perivallon==============
@@ -28,14 +31,16 @@ def verify():
     check_env(env, warn=True)
 
     print(f"  !Gymnasium check passed\n")
+    print(f"  Demand model   : {DEMAND_MODEL_PATH}  "
+          f"({type(env.demand_model).__name__})")
+    print(f"  Features       : {DEMAND_FEATURES_PATH}  "
+          f"({len(env.feature_columns)} columns)")
     print(f"  Total rooms    : {TOTAL_ROOMS}")
     print(f"  Base ADR       : €{BASE_ADR:.2f}")
     print(f"  Price range    : "
           f"€{BASE_ADR * min(PRICE_MULTIPLIERS):.2f} – "
           f"€{BASE_ADR * max(PRICE_MULTIPLIERS):.2f}")
     print(f"  Multipliers    : {PRICE_MULTIPLIERS}")
-    print(f"  Seasonality    : {SEASONALITY}")
-    print(f"  Day multipliers: {DAY_MULTIPLIERS}")
     print(f"  Occupancy boost: {OCCUPANCY_BOOST_WEIGHT}")
     print(f"  State size     : {env.observation_space.shape[0]} values")
     print(f"  Action space   : {env.action_space.n} discrete levels")
@@ -77,6 +82,36 @@ def train_ppo():
 #=============================================================
 
 
+# ==========DQN training (optional comparison)=================
+# def train_dqn():
+#     print("=" * 58)
+#     print("2) --- Train DQN ---")
+#     print("=" * 58)
+#     print(f"  Timesteps : {TOTAL_TIMESTEPS:,}")
+#     print(f"  Logs      : {DQN_LOG_DIR}")
+#     print()
+
+#     os.makedirs(DQN_LOG_DIR, exist_ok=True)
+#     env = Monitor(HotelEnv(), DQN_LOG_DIR)
+
+#     model = DQN(
+#         policy          = "MlpPolicy",
+#         env             = env,
+#         verbose         = 1,
+#         tensorboard_log = DQN_LOG_DIR,
+#         seed            = 42,
+#         device          = "cpu",
+#     )
+
+#     model.learn(total_timesteps=TOTAL_TIMESTEPS)
+#     model.save("intellirate_dqn")
+#     env.close()
+
+#     print("\n ! Model saved: intellirate_dqn.zip\n")
+#     return model
+#=============================================================
+
+
 # ==============RL policy================
 def run_policy(policy_fn, n=N_EVAL_EPISODES):
     env = HotelEnv()
@@ -111,7 +146,7 @@ def policy_rule_based(obs):
         return 2    # 0.85× = 111.35
 
 
-def compare(model):
+def compare(model, label="RL model (PPO)"):
     print("=" * 58)
     print("3) --- Policy comparison ---")
     print("=" * 58)
@@ -129,7 +164,7 @@ def compare(model):
     results = {
         "Fixed price (1.00x)": (fixed_m, fixed_s, 0.0),
         "Rule-based": (rule_m,  rule_s,  rule_imp),
-        "RL model (PPO)": (rl_m,   rl_s,   rl_imp),
+        label: (rl_m,   rl_s,   rl_imp),
     }
 
     # Print results table
@@ -144,13 +179,13 @@ def compare(model):
 
 
 # =========Curve plotting=============================
-def plot(results, path="learning_curve.png"):
+def plot(results, log_dir=LOG_DIR, label="RL model (PPO)", path="learning_curve.png"):
     print("=" * 58)
     print("4) --- Plotting curve ---")
     print("=" * 58)
 
     try:
-        x, y = ts2xy(load_results(LOG_DIR), "timesteps")
+        x, y = ts2xy(load_results(log_dir), "timesteps")
         if len(y) == 0:
             print("!No training data to plot yet!")
             return
@@ -164,7 +199,7 @@ def plot(results, path="learning_curve.png"):
 
         # Raw faint color + smoothed rl curve
         ax.plot(x,    y,    alpha=0.15, color="#2E75B6", linewidth=0.8)
-        ax.plot(x_sm, y_sm, color="#2E75B6", linewidth=2.2, label="RL model (PPO)")
+        ax.plot(x_sm, y_sm, color="#2E75B6", linewidth=2.2, label=label)
 
         # Baseline horizontal reference lines
         fixed_m = results["Fixed price (1.00x)"][0]
@@ -181,7 +216,7 @@ def plot(results, path="learning_curve.png"):
         ax.set_xlabel("Training Timesteps", fontsize=12)
         ax.set_ylabel("Episode Reward  (RevPAR)", fontsize=12)
         ax.set_title(
-            "RL Learning Curve vs Baselines\n"
+            "RL Learning Curve vs Baselines (ML demand model)\n"
             f"1 room type - "
             f"Base ADR €{BASE_ADR:.0f} - "
             f"Multipliers {PRICE_MULTIPLIERS[0]}x–{PRICE_MULTIPLIERS[-1]}x",
@@ -196,7 +231,7 @@ def plot(results, path="learning_curve.png"):
 
     except Exception as e:
         print(f"!Could not plot: {e} !")
-        print(f"Run: tensorboard --logdir {LOG_DIR}")
+        print(f"Run: tensorboard --logdir {log_dir}")
 
 
 # =============================================================================
@@ -205,8 +240,8 @@ if __name__ == "__main__":
 
     print()
     print("=" * 58)
-    print("  IntelliRate — RL")
-    print("  1 room type - simulated hotel environment")
+    print("  IntelliRate — RL  (ML demand model + PPO)")
+    print("  1 room type - Logistic Regression demand predictor")
     print(f"  Base ADR: {BASE_ADR:.2f}  -  "
           f"10 price levels")
     print("=" * 58)
@@ -214,6 +249,6 @@ if __name__ == "__main__":
 
     verify()
     model = train_ppo() #runs with PPO
-    #model = train_dqn()  #runs with DQN
+    #model = train_dqn()  #runs with DQN — uncomment + set DQN_LOG_DIR to compare
     results = compare(model)
     plot(results)
