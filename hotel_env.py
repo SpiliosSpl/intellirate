@@ -1,40 +1,3 @@
-"""
-IntelliRate — Hotel Pricing Environment (ML + DL Version)
-============================================================
-Phase 2: The environment now uses a REAL demand predictor —
-a Logistic Regression trained on the Kaggle Hotel Booking Demand
-dataset — instead of the hand-crafted sigmoid formula.
-
-ARCHITECTURE:
-    Kaggle CSV
-        → Logistic Regression (scikit-learn)   [ML — trained offline]
-        → demand_model.pkl                     [saved predictor]
-        → loaded HERE, inside the environment
-        → PPO / DQN (Stable-Baselines3)         [DL — trained here]
-
-WHAT CHANGED FROM THE DUMMY VERSION:
-    - _booking_probability() now calls the trained Logistic Regression
-      instead of a sigmoid formula.
-    - SEASONALITY and DAY_MULTIPLIERS are REMOVED as separate config —
-      they are no longer needed because the Logistic Regression already
-      learned seasonal and weekend patterns directly from real Kaggle
-      data (via the month dummy variables and is_weekend feature used
-      during training). Re-applying them here would double-count the
-      effect.
-    - OCCUPANCY_BOOST_WEIGHT is KEPT — occupancy is hotel-specific,
-      real-time state that the Kaggle dataset (booking-level records)
-      cannot capture, so it remains a separate environment-level signal.
-
-WHAT STAYED THE SAME:
-    - Action space (10 price multipliers)
-    - Reward function (RevPAR)
-    - State space structure
-    - PPO / DQN training code — completely unchanged
-
-Author    : IntelliRate — Σπηλιόπουλος Σπήλιος  AM 19153
-Supervisor: Αθανάσιος Κούτρας, University of Peloponnese 2026
-"""
-
 import numpy as np
 import pandas as pd
 import joblib
@@ -47,18 +10,20 @@ from gymnasium import spaces
 # =============================================================================
 
 TOTAL_ROOMS    = 17          # Standard/Classic rooms in the real hotel
-BASE_ADR       = 131.0       # mean ADR (€) for Standard room — used as
-                              # the CENTRE of the price multiplier range,
-                              # NOT fed into the demand model as a default;
-                              # actual prices always come from the action.
-EPISODE_LENGTH = 90          # days per training episode
+                              # (used as the capacity assumption for this
+                              # simulated environment; Kaggle itself has
+                              # no inventory data)
+BASE_ADR       = 91.0        # mean ADR (€) for Kaggle room type A — the
+                              # default CENTRE of the price multiplier
+EPISODE_LENGTH = 90           # days per training episode
 
 # 10 discrete price multipliers
-PRICE_MULTIPLIERS = [0.70, 0.80, 0.85, 0.90, 0.95,
-                     1.00, 1.05, 1.10, 1.25, 1.50]
+PRICE_MULTIPLIERS = [0.70, 0.85, 1.00, 1.10, 1.25,
+                     1.50, 1.65, 1.80, 2.00, 2.20]
 
 # Occupancy still boosts demand — this is hotel-specific real-time state,
-# not something the Kaggle demand model can know about.
+# not something the Kaggle demand model (booking-level records only) can
+# capture on its own.
 OCCUPANCY_BOOST_WEIGHT = 0.25
 
 # Paths to the files produced by train_demand_model.py
@@ -72,14 +37,14 @@ DEMAND_FEATURES_PATH = "demand_features.pkl"
 
 class HotelEnv(gym.Env):
     """
-    Hotel Room Dynamic Pricing Environment — ML + DL version.
+    Hotel Room Dynamic Pricing Environment — ML + DL version (Kaggle phase).
 
     STATE (4 values, all in [-1, 1]):
         [occupancy_rate, month_sin, month_cos, is_weekend]
 
     ACTION:
         Integer 0–9 → one of 10 PRICE_MULTIPLIERS
-        Actual price = multiplier × BASE_ADR
+        Actual price = multiplier × base_adr
 
     REWARD:
         RevPAR = (actual_price × rooms_booked) / TOTAL_ROOMS
@@ -93,13 +58,13 @@ class HotelEnv(gym.Env):
 
     def __init__(self, render_mode=None,
                 model_path=DEMAND_MODEL_PATH,
-                features_path=DEMAND_FEATURES_PATH):
+                features_path=DEMAND_FEATURES_PATH,
+                base_adr=BASE_ADR):
         super().__init__()
         self.render_mode = render_mode
+        self.base_adr    = base_adr
 
         # ── LOAD THE TRAINED ML PREDICTOR ─────────────────────────────────
-        # This is the connection point between the ML stage and the RL
-        # environment. Loaded ONCE here, then called every step().
         self.demand_model     = joblib.load(model_path)
         self.feature_columns  = joblib.load(features_path)
 
@@ -131,7 +96,7 @@ class HotelEnv(gym.Env):
 
         # Lead time proxy: how far ahead the "typical" booking decision is
         # made relative to today. Randomised per episode so the agent sees
-        # a range of booking horizons, same spirit as the dummy version.
+        # a range of booking horizons.
         self.lead_time = int(self.np_random.integers(0, 90))
 
         return self._observe(), {}
@@ -140,20 +105,19 @@ class HotelEnv(gym.Env):
     def step(self, action):
 
         multiplier   = PRICE_MULTIPLIERS[action]
-        actual_price = BASE_ADR * multiplier
+        actual_price = self.base_adr * multiplier
 
         # ── Booking probability from the trained ML model ────────────────
         prob = self._booking_probability(actual_price)
 
-        booked       = float(self.np_random.random() < prob)
+        # ── Simulate how many rooms get booked today ──────────────────────
         available    = max(0.0, TOTAL_ROOMS * (1.0 - self.occupancy))
-        rooms_booked = min(available,
-                          booked * float(self.np_random.integers(1, TOTAL_ROOMS + 1)))
+        rooms_booked = float(self.np_random.binomial(int(round(available)), prob))
 
         daily_revenue = actual_price * rooms_booked
         reward        = daily_revenue / TOTAL_ROOMS
 
-        checkout_rate  = 0.60      # avg LOS < 2 days → checkout_rate ≈ 0.60
+        checkout_rate  = 0.60      # avg LOS < 2 days → checkout_rate =+/- 0.60
         self.occupancy = float(np.clip(
             self.occupancy
             + (rooms_booked / TOTAL_ROOMS)
@@ -200,8 +164,6 @@ class HotelEnv(gym.Env):
                state the Kaggle model cannot know about.
         """
 
-        # Build a single-row feature vector, all zeros by default,
-        # matching the exact columns used during training.
         row = {col: 0 for col in self.feature_columns}
         row["adr"]        = actual_price
         row["lead_time"]  = self.lead_time
@@ -213,12 +175,8 @@ class HotelEnv(gym.Env):
 
         X = pd.DataFrame([row])[self.feature_columns]
 
-        # predict_proba returns [[P(class=0), P(class=1)]] — we want
-        # P(class=1) = P(booked)
         base_prob = float(self.demand_model.predict_proba(X)[0][1])
 
-        # Occupancy boost — real-time hotel state, added on top of the
-        # market-level prediction from the ML model.
         occ_boost = OCCUPANCY_BOOST_WEIGHT * self.occupancy
 
         return float(np.clip(base_prob + occ_boost, 0.05, 0.95))

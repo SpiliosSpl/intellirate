@@ -176,15 +176,15 @@ def validate_model(model, feature_columns, save_path="demand_validation.png"):
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
-    print(f"  ✅  Saved validation plot: {save_path}")
+    print(f" ! Saved validation plot: {save_path}")
 
     is_decreasing = probs[-1] < probs[0]
     print(f"  Price €30  → P(booking) = {probs[0]:.3f}")
     print(f"  Price €300 → P(booking) = {probs[-1]:.3f}")
     if is_decreasing:
-        print(f"  ✅  PASS — probability decreases as price increases")
+        print(f" ! PASS — probability decreases as price increases")
     else:
-        print(f"  ⚠️  FAIL — probability does not decrease with price. "
+        print(f" !!! FAIL — probability does not decrease with price. "
               f"Check feature engineering.")
     print()
 
@@ -199,8 +199,8 @@ def save_model(model, feature_columns):
     joblib.dump(model, "demand_model.pkl")
     joblib.dump(feature_columns, "demand_features.pkl")
 
-    print(f"  ✅  Saved: demand_model.pkl")
-    print(f"  ✅  Saved: demand_features.pkl")
+    print(f" ! Saved: demand_model.pkl")
+    print(f" ! Saved: demand_features.pkl")
     print(f"     ({len(feature_columns)} features, in order)\n")
 
 
@@ -217,5 +217,5 @@ if __name__ == "__main__":
     save_model(model, list(features.columns))
 
     print("=" * 58)
-    print("  Done. Next: load demand_model.pkl into hotel_env.py")
+    print("  Done. Run DL train")
     print("=" * 58)

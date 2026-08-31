@@ -12,14 +12,18 @@ from hotel_env import (
     PRICE_MULTIPLIERS, OCCUPANCY_BOOST_WEIGHT,
     DEMAND_MODEL_PATH, DEMAND_FEATURES_PATH,
 )
-# NOTE: SEASONALITY and DAY_MULTIPLIERS are gone — the Logistic Regression
-# demand model already learned seasonal + weekend patterns from the real
-# Kaggle data, so they are no longer separate config values.
 
-LOG_DIR = "./logs/ppo/" #tensorboard logs for PPO training
-#DQN_LOG_DIR = "./logs/dqn/" #tensorboard logs for DQN training
-TOTAL_TIMESTEPS = 50_000
+LOG_DIR     = "./logs/ppo/"   # tensorboard logs for PPO training
+DQN_LOG_DIR = "./logs/dqn/"   # tensorboard logs for DQN training
+TOTAL_TIMESTEPS = 20_000
 N_EVAL_EPISODES = 30
+
+# Look up action indices by multiplier VALUE instead of hardcoding them —
+# this is what broke silently last time PRICE_MULTIPLIERS was edited.
+IDX_STANDARD = PRICE_MULTIPLIERS.index(1.00)   # standard rate (fixed baseline)
+IDX_HIGH     = PRICE_MULTIPLIERS.index(1.50)   # high-demand tier (rule-based)
+IDX_LOW      = PRICE_MULTIPLIERS.index(0.85)   # low-demand tier (rule-based)
+
 
 # =========check to perivallon==============
 def verify():
@@ -83,32 +87,33 @@ def train_ppo():
 
 
 # ==========DQN training (optional comparison)=================
-# def train_dqn():
-#     print("=" * 58)
-#     print("2) --- Train DQN ---")
-#     print("=" * 58)
-#     print(f"  Timesteps : {TOTAL_TIMESTEPS:,}")
-#     print(f"  Logs      : {DQN_LOG_DIR}")
-#     print()
+def train_dqn():
+    print("=" * 58)
+    print("2) --- Train DQN ---")
+    print("=" * 58)
+    print(f"  Timesteps : {TOTAL_TIMESTEPS:,}")
+    print(f"  Logs      : {DQN_LOG_DIR}")
+    print(f"  TensorBoard: tensorboard --logdir {DQN_LOG_DIR}")
+    print()
 
-#     os.makedirs(DQN_LOG_DIR, exist_ok=True)
-#     env = Monitor(HotelEnv(), DQN_LOG_DIR)
+    os.makedirs(DQN_LOG_DIR, exist_ok=True)
+    env = Monitor(HotelEnv(), DQN_LOG_DIR)
 
-#     model = DQN(
-#         policy          = "MlpPolicy",
-#         env             = env,
-#         verbose         = 1,
-#         tensorboard_log = DQN_LOG_DIR,
-#         seed            = 42,
-#         device          = "cpu",
-#     )
+    model = DQN(
+        policy          = "MlpPolicy",
+        env             = env,
+        verbose         = 1,
+        tensorboard_log = DQN_LOG_DIR,
+        seed            = 42,
+        device          = "cpu",
+    )
 
-#     model.learn(total_timesteps=TOTAL_TIMESTEPS)
-#     model.save("intellirate_dqn")
-#     env.close()
+    model.learn(total_timesteps=TOTAL_TIMESTEPS)
+    model.save("intellirate_dqn")
+    env.close()
 
-#     print("\n ! Model saved: intellirate_dqn.zip\n")
-#     return model
+    print("\n ! Model saved: intellirate_dqn.zip\n")
+    return model
 #=============================================================
 
 
@@ -129,9 +134,9 @@ def run_policy(policy_fn, n=N_EVAL_EPISODES):
     env.close()
     return float(np.mean(rewards)), float(np.std(rewards))
 
-# ================fixed policy: 5-> 1.00× = 131euro (base ADR)==============
+# ================fixed policy: always the standard 1.00x rate==============
 def policy_fixed(obs):
-    return 5
+    return IDX_STANDARD   # 1.00x = €{BASE_ADR:.2f} (looked up, not hardcoded)
 
 # ==================rule-based policy==============
 def policy_rule_based(obs):
@@ -139,11 +144,11 @@ def policy_rule_based(obs):
     is_weekend = obs[3] > 0.0
 
     if occupancy > 0.70 or is_weekend:
-        return 7    # 1.10× = 144.10
+        return IDX_HIGH      # 1.50x — high demand, charge more
     elif occupancy > 0.35:
-        return 5    # 1.00× = 131.00
+        return IDX_STANDARD  # 1.00x — moderate demand
     else:
-        return 2    # 0.85× = 111.35
+        return IDX_LOW       # 0.85x — low demand, discount to fill rooms
 
 
 def compare(model, label="RL model (PPO)"):
@@ -162,7 +167,7 @@ def compare(model, label="RL model (PPO)"):
     rl_imp  = (rl_m  - fixed_m) / fixed_m * 100
 
     results = {
-        "Fixed price (1.00x)": (fixed_m, fixed_s, 0.0),
+        f"Fixed price ({PRICE_MULTIPLIERS[IDX_STANDARD]:.2f}x)": (fixed_m, fixed_s, 0.0),
         "Rule-based": (rule_m,  rule_s,  rule_imp),
         label: (rl_m,   rl_s,   rl_imp),
     }
@@ -174,6 +179,14 @@ def compare(model, label="RL model (PPO)"):
     for name, (m, s, imp) in results.items():
         imp_str = f"{imp:+.1f}%" if imp != 0.0 else "—"
         print(f"  {name:<24} {m:>12.2f} {s:>8.2f} {imp_str:>10}")
+    print()
+    print("  NOTE: Kaggle's price elasticity is genuinely weak (coefficient")
+    print("  ~-0.0054/€, confirmed with multiple diagnostics). This phase")
+    print("  validates that the ML->DL pipeline runs correctly end-to-end;")
+    print("  it is not expected to produce a literature-comparable RevPAR")
+    print("  percentage on its own. That result comes from the real-hotel")
+    print("  fine-tuning phase (much stronger elasticity, ~8x coefficient).")
+    print()
 
     return results
 
@@ -202,7 +215,8 @@ def plot(results, log_dir=LOG_DIR, label="RL model (PPO)", path="learning_curve.
         ax.plot(x_sm, y_sm, color="#2E75B6", linewidth=2.2, label=label)
 
         # Baseline horizontal reference lines
-        fixed_m = results["Fixed price (1.00x)"][0]
+        fixed_key = f"Fixed price ({PRICE_MULTIPLIERS[IDX_STANDARD]:.2f}x)"
+        fixed_m = results[fixed_key][0]
         rule_m  = results["Rule-based"][0]
         ax.axhline(
             fixed_m, color="#E24B4A", linestyle="--", linewidth=1.5,
@@ -216,7 +230,7 @@ def plot(results, log_dir=LOG_DIR, label="RL model (PPO)", path="learning_curve.
         ax.set_xlabel("Training Timesteps", fontsize=12)
         ax.set_ylabel("Episode Reward  (RevPAR)", fontsize=12)
         ax.set_title(
-            "RL Learning Curve vs Baselines (ML demand model)\n"
+            "RL Learning Curve vs Baselines (Kaggle demand model)\n"
             f"1 room type - "
             f"Base ADR €{BASE_ADR:.0f} - "
             f"Multipliers {PRICE_MULTIPLIERS[0]}x–{PRICE_MULTIPLIERS[-1]}x",
@@ -249,6 +263,6 @@ if __name__ == "__main__":
 
     verify()
     model = train_ppo() #runs with PPO
-    #model = train_dqn()  #runs with DQN — uncomment + set DQN_LOG_DIR to compare
+    #model = train_dqn()  #runs with DQN — uncomment to compare instead
     results = compare(model)
     plot(results)
