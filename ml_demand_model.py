@@ -1,59 +1,3 @@
-"""
-IntelliRate — ML Demand Predictor (Random Forest)
-====================================================
-Reads the hotel's PMS export (BOOKINGS.xlsx) AS IS and builds everything
-the simulator needs:
-
-  1. Daily demand table — booking requests per arrival date.
-  2. Two ML predictors of daily booking requests from calendar features
-     (season, month, day of year, weekday, holidays):
-        ML1 = Random Forest        ("rf")
-        ML2 = XGBoost, Poisson     ("xgb")
-     Both are evaluated with the SAME blocked cross-validation against a
-     naive baseline, and both are saved, so the RL stage can run
-     ML1 + PPO and ML2 + PPO and compare them.
-  3. Simulation data — saved to sim_data.pkl for hotel_season_env.py.
-
-PRICES IN THIS VERSION: recorded prices, no BAR reconstruction
-    The hotel's price on a date is taken as the average RECORDED price per
-    room-night (Total / Room-Nights) of the bookings arriving that date,
-    smoothed over 7 days. Smoothing is needed because the recorded price
-    also moves with the booking mix (non-refundable, Genius, Expedia net
-    prices), not only with the hotel's decisions.
-    A later phase will replace this with the reconstructed base rate (BAR);
-    only hotel_price_per_date() needs to change.
-
-WHAT THE RANDOM FOREST PREDICTS, AND WHY
-    Target = booking requests per arrival date (confirmed + later cancelled).
-    Price is deliberately NOT a feature: the hotel priced almost flat and
-    nudged prices up on busy dates, so price and demand are positively
-    correlated in the data (price endogeneity). The RF therefore learns
-    demand AT THE HOTEL'S OWN PRICES; the response to other prices is added
-    in the environment through an elasticity parameter (scenario).
-
-    Predicting daily COUNTS keeps simulated demand on the hotel's real
-    scale (~2-5 requests/day). An earlier version predicted "booked vs
-    cancelled" per booking, and its probabilities (~0.8) were wrongly used
-    as the chance that every empty room sells every day.
-
-TWO PREDICTIONS ARE SAVED PER DATE, FOR EACH MODEL
-    lambda_true     : in-sample fit, calibrated to the season's total —
-                      the simulator's expected demand ("the world").
-    lambda_forecast : out-of-fold prediction (the model never saw that
-                      week) — the RL agent's (imperfect) forecast.
-
-SCOPE
-    STD rooms, seasons 2025 and 2026. Season 2026 is cut at the export date:
-    later stay dates have an incomplete booking curve.
-    Online channels only (OTAs, Expedia, hotel website).
-
-Usage:   python ml_demand_model.py        (requires: pip install xgboost)
-Outputs: demand_models.pkl, sim_data.pkl, demand_fit.png, ml_comparison.csv
-
-Author    : IntelliRate — Σπηλιόπουλος Σπήλιος  AM 19153
-Supervisor: Αθανάσιος Κούτρας, University of Peloponnese 2026
-"""
-
 import numpy as np
 import pandas as pd
 import joblib
@@ -301,7 +245,7 @@ def build_sim_data(bk, daily, results):
     return {"seasons": seasons, "capacity": CAPACITY, "models": MODEL_NAMES,
             "dispersion_k": {n: r["k"] for n, r in results.items()}}
 
-
+# ==================plotting====================
 def plot_fit(daily, results, path="demand_fit.png"):
     colours = {"rf": "#2E75B6", "xgb": "#27AE60"}
     fig, axes = plt.subplots(len(SEASONS), 1, figsize=(12, 3.8 * len(SEASONS)))

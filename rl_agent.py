@@ -1,50 +1,3 @@
-"""
-IntelliRate — PPO Pricing Agent (ML1 + PPO vs ML2 + PPO vs hotel)
-====================================================================
-For each ML demand model (ML1 = Random Forest, ML2 = XGBoost), trains a
-PPO agent in the season simulator and compares its pricing with the
-decisions the hotel actually took. A final table compares the two
-pipelines with each other and with the real season.
-
-COMPARISON — within each pipeline, all policies face the SAME simulated
-seasons (same guests, demand shocks, cancellations; only prices differ):
-    1. Hotel       — the price the hotel actually charged on each date
-                     (smoothed average recorded price per room-night;
-                     a later phase replaces this with the reconstructed BAR)
-    2. Best fixed  — the single best constant price for the season
-    3. PPO         — the trained agent, one run per random seed
-
-Reading the result:
-    Best fixed vs Hotel = gain from a better AVERAGE price level; driven
-                          almost entirely by the elasticity assumption.
-    PPO vs Best fixed   = gain from adapting the price DAY BY DAY — the
-                          value of dynamic pricing. If PPO does not beat
-                          the best fixed price, it learned nothing dynamic.
-
-TWO WAYS TO COMPARE ML1 AND ML2
-    default                : each model defines its own world and forecast
-                             ("does the conclusion hold whichever model
-                             builds the simulator?")
-    --common-world rf|xgb  : one shared world, only the agent's forecast
-                             differs ("which model helps pricing more?")
-
-TRAINING SETTINGS (validated on an environment with a known optimum):
-    reward normalisation, entropy bonus 0.01, n_steps 2048, batch 256,
-    300k timesteps, several seeds. Evaluation seasons use random seeds
-    never seen during training.
-
-Usage:
-    python rl_agent.py --season 2026
-    python rl_agent.py --season 2025 --models rf xgb --timesteps 300000
-    python rl_agent.py --season 2026 --common-world xgb
-
-Outputs: one folder per pipeline (results.csv, summary.txt, plots, models)
-         + comparison_<season>_e<elasticity>.csv / .png
-
-Author    : IntelliRate — Σπηλιόπουλος Σπήλιος  AM 19153
-Supervisor: Αθανάσιος Κούτρας, University of Peloponnese 2026
-"""
-
 import argparse
 import os
 
@@ -80,6 +33,7 @@ PPO_PARAMS = dict(learning_rate=3e-4, n_steps=2048, batch_size=256,
                   n_epochs=10, gamma=0.99, ent_coef=0.01)
 
 SENSITIVITY_ELASTICITIES = [0.6, 0.8, 1.0, 1.2, 1.5]
+SENSITIVITY_N_EVAL       = 100     # seasons per policy (same for hotel and fixed)
 
 
 # =============================================================================
@@ -135,8 +89,8 @@ def summarise(name, df, base, env):
     }
 
 
-def find_best_fixed(env):
-    means = [run_policy(env, fixed_policy(a))[0]["reward"].mean()
+def find_best_fixed(env, n=N_EVAL):
+    means = [run_policy(env, fixed_policy(a), n=n)[0]["reward"].mean()
              for a in range(len(PRICE_MULTIPLIERS))]
     return int(np.argmax(means)), means
 
@@ -285,8 +239,8 @@ def run_pipeline(model_name, args):
         sens = []
         for eps in SENSITIVITY_ELASTICITIES:
             e = HotelEnv(**{**env_kwargs, "elasticity": eps})
-            h, _ = run_policy(e, hotel_policy, n=100)
-            b, means = find_best_fixed(e)
+            h, _ = run_policy(e, hotel_policy, n=SENSITIVITY_N_EVAL)
+            b, means = find_best_fixed(e, n=SENSITIVITY_N_EVAL)     # same seasons: paired
             sens.append({"elasticity": eps, "best_fixed_multiplier": PRICE_MULTIPLIERS[b],
                          "best_fixed_vs_hotel_%": 100 * (means[b] / h["reward"].mean() - 1)})
         sens = pd.DataFrame(sens)
