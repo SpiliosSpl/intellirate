@@ -86,4 +86,3 @@ dependencies:
       - tzdata==2026.2
       - werkzeug==3.1.8
       - xgboost==3.4.1
-prefix: C:\Users\sp1ls\miniconda3\envs\intellirate-cpu

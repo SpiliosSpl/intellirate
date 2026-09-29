@@ -2,9 +2,9 @@ IntelliRate: A Machine and Deep Learning System for Dynamic Pricing of Hotel Roo
 SPILIOS G. SPILIOPOULOS
 University of the Peloponnese - Electrical and Computer Engineering Dept.
 
-data csv: https://www.kaggle.com/datasets/jessemostipak/hotel-booking-demand
+data: private hotel data file
 
 How-to:
-1. create the conda env and activate it
-2. run the train_demand model
-3. finally run the train.py model
+1. create the conda env and activate it (CPU device)
+2. run the ml_demand_model
+3. run the rl_agent model

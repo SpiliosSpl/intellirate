@@ -66,7 +66,9 @@ def load_raw(path=XLSX_PATH):
     df["rooms"]        = df["Rooms"].astype(int)
     df["room_nights"]  = df["Room-Nights"].astype(int)
     df["is_cancelled"] = df["Status"].eq("CL").astype(int)
-    df["price"]        = df["Total"] / df["room_nights"]   # recorded, per night
+    # Rates as recorded: Total per room-night, no channel/rate-plan normalisation
+    # (Expedia net of commission, NR and promo discounts all left as they are).
+    df["price"]        = df["Total"] / df["room_nights"]
     return df, export_date
 
 
@@ -101,8 +103,9 @@ def holiday_features(dates):
 
 
 def hotel_price_per_date(bookings, dates):
-    """The hotel's price on each date. THIS VERSION: smoothed average
-    recorded price per room-night. Later phase: reconstructed BAR."""
+    """The hotel's price on each date. THIS VERSION: median recorded price
+    per room-night of the bookings arriving that day (cancelled included),
+    7-day rolling median, gaps interpolated. Later phase: reconstructed BAR."""
     daily = bookings.groupby("arrival")["price"].median().reindex(dates)
     smooth = daily.rolling(PRICE_SMOOTHING_DAYS, center=True, min_periods=1).median()
     return smooth.interpolate().ffill().bfill()
