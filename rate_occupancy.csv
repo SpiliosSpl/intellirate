@@ -1,0 +1,9 @@
+season,occupancy,occ_price,double,status,note
+2025,single,,,confirmed,No single rate in 2025: one guest pays the double BAR
+2025,triple,180,,confirmed,Fixed triple price: carries no BAR information
+2025,triple,170,,measured,Fixed triple price for bookings made in Oct 2025 (3 bookings)
+2026,single,145,160,measured,28 same-night pairs with a 160 double
+2026,single,138,150,measured,One Expedia booking (2 rooms) next to a 150 double
+2026,triple,177,150,measured,Per-level triple price; 11 same-night pairs
+2026,triple,184,155,measured,Per-level triple price; 6 same-night pairs
+2026,triple,189,160,measured,Per-level triple price; 34 same-night pairs

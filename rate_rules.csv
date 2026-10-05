@@ -1,0 +1,12 @@
+rule_id,season,channel,field,pattern,factor,book_from,book_to,round_to,status,note
+nr,*,.*,Rate,^NR|Non Refundable,0.90,,,,confirmed,Non-refundable plan: 10% off Flexible on every channel
+genius,*,Booking.com,Channel Notes for Hotelier,Genius Booker,0.90,,,,confirmed,Booking.com Genius 10%; stacks with NR
+genius_unflagged,*,Booking.com,@infer,genius,0.90,2025-06-22,2025-12-31,,inferred,Booking.com booking without the Genius flag that prices like Genius. Decided per booking against the BAR ladder; the booking-date window is the prior when the ladder cannot decide
+last_minute,*,Booking.com,Room Type Name,Last Minute Deal,0.95,,,,confirmed,Booking.com Last Minute Deal; stacks (value 5% measured from the data)
+exp_member_10,*,Expedia|Expedia Hotel Collect,Rate,Member 10%,0.90,,,,confirmed,Expedia Blue Member 10% (2025); stacks with NR
+exp_member_7,*,Expedia|Expedia Hotel Collect,Rate,Member 7%,0.93,,,,confirmed,Expedia Blue Member 7% (2026); stacks with NR
+exp_mobile_7,*,Expedia|Expedia Hotel Collect,Rate,Mobile 7%,0.93,,,,confirmed,Expedia Mobile 7% (2026); stacks with NR
+exp_commission,*,Expedia,*,,0.82,,,,confirmed,Expedia Collect Total is net of 18% commission (Hotel Collect is gross)
+direct_offer,2025,Direct,*,,0.88,,,,confirmed,Website / Google Free Booking Links permanent 12% direct offer; stacks with NR
+web_member,2026,Direct,SmartGuest,Member,0.90,,2026-08-31,,confirmed,Website member programme 10%; stacks with NR
+web_member_sep,2026,Direct,SmartGuest,Member,0.855,2026-09-01,,1,confirmed,Website member programme 14.5% for bookings made from 1 Sep 2026 (any stay date); stacks with NR; only these rates are rounded to the euro after the discounts

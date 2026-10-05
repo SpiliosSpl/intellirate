@@ -9,7 +9,7 @@ SIM_DATA_PATH = "sim_data.pkl"
 ELASTICITY    = 1.0          # price elasticity at the reference price (scenario)
 VARIABLE_COST = 0.0          # EUR per sold room-night (unknown -> 0 = revenue)
 
-# Price levels as multiples of the season reference (+/-25%)
+# BAR levels as multiples of the season reference, the median BAR (+/-25%)
 PRICE_MULTIPLIERS = [0.75, 0.80, 0.85, 0.90, 0.95, 1.00,
                      1.05, 1.10, 1.15, 1.20, 1.25]
 
@@ -126,6 +126,7 @@ class HotelEnv(gym.Env):
                 lost += 1
                 continue
             self.committed[t:t + nights] += rooms
+            # Total = its BAR x its own occupancy/channel/plan factors -> same factors at this BAR
             revenue += pool["total"][i] * price / pool["orig_price"][i]
             room_nights += rooms * nights
             accepted += 1

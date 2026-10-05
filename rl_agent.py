@@ -165,11 +165,11 @@ def plot_price_path(env, hotel_path, rl_paths, path, title):
     """rl_paths: {algorithm display name: price path of one simulated season}."""
     fig, ax1 = plt.subplots(figsize=(12, 5))
     ax1.step(hotel_path["date"], hotel_path["price"], where="mid", color="#C0392B",
-             lw=1.4, label="Hotel price (recorded)")
+             lw=1.4, label="Hotel BAR (reconstructed)")
     for colour, (name, p) in zip(RL_COLOURS, rl_paths.items()):
         ax1.step(p["date"], p["price"], where="mid", color=colour,
                  lw=1.4, label=f"{name} price")
-    ax1.set_ylabel("Average price per room-night (EUR)")
+    ax1.set_ylabel("BAR, double occupancy (EUR / night)")
     ax2 = ax1.twinx()
     ax2.fill_between(env.dates, env.forecast, color="grey", alpha=0.2,
                      label="Demand forecast (requests/day)")
@@ -232,8 +232,8 @@ def run_pipeline(model_name, args):
     out("=" * 72,
         f" {label} + {algo_names} | STD | season {args.season} | "
         f"{env.dates[0].date()} -> {env.dates[-1].date()} ({env.n_days} days)",
-        f" {env.capacity} rooms, elasticity {args.elasticity}, price levels "
-        f"EUR {env.prices[0]:.0f}-{env.prices[-1]:.0f} (reference EUR {env.p_ref:.0f})",
+        f" {env.capacity} rooms, elasticity {args.elasticity}, BAR levels "
+        f"EUR {env.prices[0]:.0f}-{env.prices[-1]:.0f} (reference: median BAR EUR {env.p_ref:.0f})",
         "=" * 72)
 
     # 1. Hotel baseline + validation against the real season
@@ -248,7 +248,7 @@ def run_pipeline(model_name, args):
     # 2. Best fixed price
     best, _ = find_best_fixed(env)
     fixed, _ = run_policy(env, fixed_policy(best))
-    out(f"Best fixed price: {PRICE_MULTIPLIERS[best]:.2f}x = EUR {env.prices[best]:.0f}")
+    out(f"Best fixed price: {PRICE_MULTIPLIERS[best]:.2f}x = BAR EUR {env.prices[best]:.0f}")
     level = 100 * (fixed["reward"].mean() / hotel["reward"].mean() - 1)
 
     # 3. Each RL algorithm, several seeds, evaluated on the same seasons
@@ -370,7 +370,7 @@ def main():
               .to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
     print()
     print(" sim_vs_real_*      : how well each simulator reproduces the REAL season")
-    print(" rl_vs_hotel_%      : RL revenue vs the hotel's actual pricing (same seasons)")
+    print(" rl_vs_hotel_%      : RL revenue vs the hotel's actual pricing, its BAR (same seasons)")
     print(" rl_vs_best_fixed_% : value of day-by-day pricing (must be > 0 to claim it)")
     top = comp.loc[comp["rl_vs_hotel_%"].idxmax()]
     print(f"\n Best combination: {top['pipeline']}  "

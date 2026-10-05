@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -22,12 +24,15 @@ except ImportError as exc:
 XLSX_PATH = "BOOKINGS.xlsx"
 ROOM_TYPE = "STD"
 SEASONS   = [2025, 2026]
+SUMMER    = ("04-01", "10-31")      # arrivals studied in every season (MM-DD)
 CAPACITY  = 17                      # physical STD rooms
 
 PII_COLUMNS = ["First Name", "Last Name", "Email", "Telephone", "Card",
                "Guest's Company", "Geo", "Location", "Region", "External ID"]
 
-PRICE_SMOOTHING_DAYS = 7            # rolling median of the daily price
+# Reconstructed Best Available Rate (output of bar_rates.py)
+BAR_DAILY_PATH    = "bar_daily.csv"     # double-occupancy BAR per stay night
+BAR_BOOKINGS_PATH = "bar_bookings.csv"  # BAR each booking was priced from
 
 RF_PARAMS = dict(n_estimators=500, min_samples_leaf=3, max_features=0.6,
                  random_state=42, n_jobs=-1)
@@ -39,11 +44,12 @@ XGB_PARAMS = dict(objective="count:poisson", n_estimators=400, learning_rate=0.0
 
 MODEL_NAMES = {"rf": "ML1 Random Forest", "xgb": "ML2 XGBoost (Poisson)"}
 
+N_FOLDS = 5                          # blocked by ISO week (no leakage in time)
+MIN_PROFILES_PER_MONTH = 20          # else fall back to the whole season
+
 
 def make_model(name):
     return RandomForestRegressor(**RF_PARAMS) if name == "rf" else XGBRegressor(**XGB_PARAMS)
-N_FOLDS = 5                          # blocked by ISO week (no leakage in time)
-MIN_PROFILES_PER_MONTH = 20          # else fall back to the whole season
 
 
 # =============================================================================
@@ -51,7 +57,9 @@ MIN_PROFILES_PER_MONTH = 20          # else fall back to the whole season
 # =============================================================================
 
 def load_raw(path=XLSX_PATH):
-    df = pd.read_excel(path, sheet_name=0)
+    with warnings.catch_warnings():          # the export has no default cell style
+        warnings.filterwarnings("ignore", "Workbook contains no default style", UserWarning)
+        df = pd.read_excel(path, sheet_name=0)
     df = df.drop(columns=[c for c in PII_COLUMNS if c in df.columns])
     df = df[df["Status"].notna()].copy()                   # empty trailer row
     export_date = pd.to_datetime(df["Booking Date"]).max().normalize()
@@ -60,16 +68,33 @@ def load_raw(path=XLSX_PATH):
     df["departure"] = pd.to_datetime(df["Check-Out"]).dt.normalize()
     df["season"]    = df["arrival"].dt.year
     df = df[(df["Room Type"] == ROOM_TYPE) & (df["season"].isin(SEASONS))]
-    df = df[df["arrival"] <= export_date].copy()
+    md = df["arrival"].dt.strftime("%m-%d")
+    df = df[(md >= SUMMER[0]) & (md <= SUMMER[1]) & (df["arrival"] <= export_date)].copy()
 
     df["nights"]       = (df["departure"] - df["arrival"]).dt.days
     df["rooms"]        = df["Rooms"].astype(int)
     df["room_nights"]  = df["Room-Nights"].astype(int)
     df["is_cancelled"] = df["Status"].eq("CL").astype(int)
-    # Rates as recorded: Total per room-night, no channel/rate-plan normalisation
-    # (Expedia net of commission, NR and promo discounts all left as they are).
+    # Recorded rate: Total per room-night, as paid (channel, plan, occupancy
+    # and promos included). bar_rates.py unwinds it to the BAR.
     df["price"]        = df["Total"] / df["room_nights"]
     return df, export_date
+
+
+def load_bar(bk):
+    """From bar_rates.py: the daily BAR (Series by date) and each booking's
+    reference BAR (aligned with bk). Fails loudly when the files are missing
+    or out of date."""
+    try:
+        daily = pd.read_csv(BAR_DAILY_PATH, parse_dates=["date"]).set_index("date")["bar"]
+        per_booking = pd.read_csv(BAR_BOOKINGS_PATH).set_index("ID")["bar_ref"]
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"{exc.filename} not found: run python bar_rates.py first") from exc
+    bar_ref = bk["ID"].astype("int64").map(per_booking)
+    if bar_ref.isna().any():
+        raise ValueError(f"{bar_ref.isna().sum()} bookings have no BAR: re-run python bar_rates.py "
+                         "(BOOKINGS.xlsx or the rate files changed)")
+    return daily, bar_ref.values
 
 
 # =============================================================================
@@ -102,33 +127,30 @@ def holiday_features(dates):
     return out
 
 
-def hotel_price_per_date(bookings, dates):
-    """The hotel's price on each date. THIS VERSION: median recorded price
-    per room-night of the bookings arriving that day (cancelled included),
-    7-day rolling median, gaps interpolated. Later phase: reconstructed BAR."""
-    daily = bookings.groupby("arrival")["price"].median().reindex(dates)
-    smooth = daily.rolling(PRICE_SMOOTHING_DAYS, center=True, min_periods=1).median()
-    return smooth.interpolate().ffill().bfill()
+def hotel_price_per_date(bar_daily, dates):
+    """The hotel's price on each date: the reconstructed double-occupancy BAR
+    (bar_rates.py). Not smoothed: it is the price the hotel set. Any date the
+    BAR file does not cover takes the nearest BAR."""
+    return bar_daily.reindex(dates).interpolate().ffill().bfill()
 
 
 FEATURES = ["season", "month", "day_of_year", "dow", "days_from_start",
             "easter_window", "whit_window", "public_holiday"]
 
 
-def build_daily(bk, export_date):
+def build_daily(bk, bar_daily):
     frames = []
     for season in SEASONS:
         s = bk[bk["season"] == season]
         start = s["arrival"].min()
-        end = min(s["arrival"].max(), export_date)
-        dates = pd.date_range(start, end, freq="D")
+        dates = pd.date_range(start, s["arrival"].max(), freq="D")   # load_raw caps at the export
 
         d = pd.DataFrame(index=dates)
         d["season"]    = season
         d["requests"]  = s.groupby("arrival")["rooms"].sum().reindex(dates, fill_value=0)
         d["confirmed"] = s[s["is_cancelled"] == 0].groupby("arrival")["rooms"].sum() \
                           .reindex(dates, fill_value=0)
-        d["hotel_price"] = hotel_price_per_date(s, dates)
+        d["hotel_price"] = hotel_price_per_date(bar_daily, dates)
         d["month"] = dates.month
         d["day_of_year"] = dates.dayofyear
         d["dow"] = dates.dayofweek
@@ -217,9 +239,10 @@ def build_sim_data(bk, daily, results):
     for season in SEASONS:
         d = daily[daily["season"] == season]
         s = bk[bk["season"] == season].copy()
-        # Each booking remembers the hotel's price on its own arrival date,
-        # so the simulator can scale its real Total to any other price.
-        s["orig_price"] = d["hotel_price"].reindex(s["arrival"]).values
+        # Each booking remembers the BAR it was priced from, so the simulator
+        # can scale its real Total to any other BAR: the guest keeps their own
+        # occupancy, channel and plan factors (Total = BAR x factors).
+        s["orig_price"] = s["bar_ref"].values
         cols = ["rooms", "nights", "Total", "orig_price", "is_cancelled"]
         season_pool = s[cols].reset_index(drop=True)
         pools = {}
@@ -278,17 +301,18 @@ def plot_fit(daily, results, path="demand_fit.png"):
 
 if __name__ == "__main__":
     bk, export_date = load_raw()
+    bar_daily, bk["bar_ref"] = load_bar(bk)
     print("=" * 66)
-    print(f"  Bookings: {len(bk)} STD (export date {export_date.date()}; "
-          f"later stay dates excluded)")
+    print(f"  Bookings: {len(bk)} STD, summer arrivals {SUMMER[0]} -> {SUMMER[1]} "
+          f"(export date {export_date.date()}; later stay dates excluded)")
     print("=" * 66 + "\n")
 
-    daily = build_daily(bk, export_date)
+    daily = build_daily(bk, bar_daily)
     for season in SEASONS:
         d = daily[daily["season"] == season]
         print(f"  Season {season}: {d.index.min().date()} -> {d.index.max().date()}  "
               f"({len(d)} days, {d['requests'].mean():.2f} requests/day, "
-              f"hotel price median EUR {d['hotel_price'].median():.0f}/night)")
+              f"BAR median EUR {d['hotel_price'].median():.0f}/night)")
     print()
 
     results = train_models(daily)
