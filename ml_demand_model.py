@@ -25,7 +25,7 @@ XLSX_PATH = "BOOKINGS.xlsx"
 ROOM_TYPE = "STD"
 SEASONS   = [2025, 2026]
 SUMMER    = ("04-01", "10-31")      # arrivals studied in every season (MM-DD)
-CAPACITY  = 17                      # physical STD rooms
+CAPACITY  = {2025: 18, 2026: 17}    # physical STD rooms (room 108 left STD after 2025)
 
 PII_COLUMNS = ["First Name", "Last Name", "Email", "Telephone", "Card",
                "Guest's Company", "Geo", "Location", "Region", "External ID"]
@@ -252,6 +252,7 @@ def build_sim_data(bk, daily, results):
 
         ok = s[s["is_cancelled"] == 0]
         seasons[season] = {
+            "capacity":        CAPACITY[season],
             "dates":           d.index,
             "lambda_true":     {n: d[f"true_{n}"].values for n in results},
             "lambda_forecast": {n: d[f"fcst_{n}"].values for n in results},
@@ -263,12 +264,12 @@ def build_sim_data(bk, daily, results):
             "profiles":        pools,
             "actual": {        # what really happened, for simulator validation
                 "requests":    int(d["requests"].sum()),
-                "confirmed":   int(ok["rooms"].sum()),
+                "confirmed":   int(len(ok)),          # bookings, as the env counts them
                 "room_nights": int(ok["room_nights"].sum()),
                 "revenue":     float(ok["Total"].sum()),
             },
         }
-    return {"seasons": seasons, "capacity": CAPACITY, "models": MODEL_NAMES,
+    return {"seasons": seasons, "models": MODEL_NAMES,
             "dispersion_k": {n: r["k"] for n, r in results.items()}}
 
 # ==================plotting====================

@@ -25,7 +25,7 @@ SEASON      = 2026
 MODELS      = ["rf", "xgb"]
 MODEL_NAMES = {"rf": "ML1 RF", "xgb": "ML2 XGB"}
 ELASTICITY  = 1.0
-CAPACITY    = None                 # None -> 17 STD rooms
+CAPACITY    = None                 # None -> the season's STD rooms (2025: 18, 2026: 17)
 TIMESTEPS   = 300_000              # per algorithm and seed
 SEEDS       = [42, 7, 123]
 JOBS        = 3                    # parallel processes: the seeds of one ML x RL train together
@@ -113,9 +113,12 @@ def summarise(name, df, base, env):
 
 
 def find_best_fixed(env, n=N_EVAL):
-    means = [run_policy(env, fixed_policy(a), n=n)[0]["reward"].mean()
-             for a in range(len(PRICE_MULTIPLIERS))]
-    return int(np.argmax(means)), means
+    """Best constant price level: (its action, mean reward of every level,
+    its evaluation seasons)."""
+    runs = [run_policy(env, fixed_policy(a), n=n)[0] for a in range(len(PRICE_MULTIPLIERS))]
+    means = [df["reward"].mean() for df in runs]
+    best = int(np.argmax(means))
+    return best, means, runs[best]
 
 
 def train_agent(algo, seed, log_dir, env_kwargs, timesteps):
@@ -246,8 +249,7 @@ def run_pipeline(model_name, args):
         f"   revenue {val['revenue']:+.1%}")
 
     # 2. Best fixed price
-    best, _ = find_best_fixed(env)
-    fixed, _ = run_policy(env, fixed_policy(best))
+    best, _, fixed = find_best_fixed(env)
     out(f"Best fixed price: {PRICE_MULTIPLIERS[best]:.2f}x = BAR EUR {env.prices[best]:.0f}")
     level = 100 * (fixed["reward"].mean() / hotel["reward"].mean() - 1)
 
@@ -322,7 +324,7 @@ def run_pipeline(model_name, args):
         for eps in SENSITIVITY_ELASTICITIES:
             e = HotelEnv(**{**env_kwargs, "elasticity": eps})
             h, _ = run_policy(e, hotel_policy, n=SENSITIVITY_N_EVAL)
-            b, means = find_best_fixed(e, n=SENSITIVITY_N_EVAL)     # same seasons: paired
+            b, means, _ = find_best_fixed(e, n=SENSITIVITY_N_EVAL)  # same seasons: paired
             sens.append({"elasticity": eps, "best_fixed_multiplier": PRICE_MULTIPLIERS[b],
                          "best_fixed_vs_hotel_%": 100 * (means[b] / h["reward"].mean() - 1)})
         sens = pd.DataFrame(sens)

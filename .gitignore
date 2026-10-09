@@ -2,6 +2,9 @@ __pycache__/
 .vscode/
 logs/
 BOOKINGS.*
+hotel_pms_data.*
+avl-status*
+kaggle_data.*
 bar_bookings.csv
 bar_daily.csv
 bar_validation.txt
