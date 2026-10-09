@@ -187,12 +187,22 @@ def train_models(daily):
         model = make_model(name).fit(X, y)
         fit = model.predict(X)
 
-        # Day-to-day variability around this model's forecast
+        # Day-to-day variability around this model's forecast (reported)
         resid_var, mean_lam = np.var(y - oof), np.mean(oof)
         k = mean_lam ** 2 / (resid_var - mean_lam) if resid_var > mean_lam * 1.05 else None
+        # Shocks for the simulated world: the world's pattern is the in-sample
+        # fit, which already holds part of the data's luck. Choose k so that the
+        # world's total variance equals the real one:
+        # Var(y) = E[fit] + Var(fit) + E[fit^2] / k
+        k_world = {}
+        for season in SEASONS:                      # one k per season
+            m = (daily["season"] == season).values
+            extra = np.var(y[m]) - np.mean(fit[m]) - np.var(fit[m])
+            k_world[season] = (np.mean(fit[m] ** 2) / extra
+                               if extra > 0.05 * np.mean(fit[m]) else None)
 
         imp = pd.Series(model.feature_importances_, index=FEATURES)
-        results[name] = dict(model=model, fit=fit, oof=oof, k=k, importance=imp)
+        results[name] = dict(model=model, fit=fit, oof=oof, k=k, k_world=k_world, importance=imp)
         rows.append((MODEL_NAMES[name], oof, k))
 
     rows.append(("Baseline: season-month mean", oof_base, None))
@@ -253,6 +263,7 @@ def build_sim_data(bk, daily, results):
         ok = s[s["is_cancelled"] == 0]
         seasons[season] = {
             "capacity":        CAPACITY[season],
+            "dispersion_k":    {n: r["k_world"][season] for n, r in results.items()},
             "dates":           d.index,
             "lambda_true":     {n: d[f"true_{n}"].values for n in results},
             "lambda_forecast": {n: d[f"fcst_{n}"].values for n in results},
@@ -269,8 +280,7 @@ def build_sim_data(bk, daily, results):
                 "revenue":     float(ok["Total"].sum()),
             },
         }
-    return {"seasons": seasons, "models": MODEL_NAMES,
-            "dispersion_k": {n: r["k"] for n, r in results.items()}}
+    return {"seasons": seasons, "models": MODEL_NAMES}
 
 # ==================plotting====================
 def plot_fit(daily, results, path="demand_fit.png"):

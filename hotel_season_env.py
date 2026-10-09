@@ -44,7 +44,7 @@ class HotelEnv(gym.Env):
         self.elasticity    = elasticity
         self.variable_cost = variable_cost
         self.capacity      = capacity or s["capacity"]                # rooms of this season
-        self.k             = data["dispersion_k"][demand_model]   # None -> Poisson
+        self.k             = s["dispersion_k"][demand_model]      # None -> Poisson
 
         self.dates       = s["dates"]
         self.n_days      = len(self.dates)
