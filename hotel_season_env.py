@@ -33,9 +33,9 @@ class HotelEnv(gym.Env):
 
     def __init__(self, season=2025, demand_model="rf", forecast_model=None,
                  elasticity=ELASTICITY, variable_cost=VARIABLE_COST,
-                 capacity=None, sim_path=SIM_DATA_PATH):
+                 sim_path=SIM_DATA_PATH, sim=None):
         super().__init__()
-        data = joblib.load(sim_path)
+        data = sim if sim is not None else joblib.load(sim_path)   # sim: the dict itself
         s = data["seasons"][season]
         forecast_model = forecast_model or demand_model
         self.demand_model, self.forecast_model = demand_model, forecast_model
@@ -43,7 +43,10 @@ class HotelEnv(gym.Env):
         self.season        = season
         self.elasticity    = elasticity
         self.variable_cost = variable_cost
-        self.capacity      = capacity or s["capacity"]                # rooms of this season
+        self.capacity      = s["capacity"]                        # rooms of this season
+        # Rooms left for online sale each night (PMS); the rest are offline stays
+        self.online_avail  = s["online_avail"]
+        self.offline       = self.capacity - self.online_avail
         self.k             = s["dispersion_k"][demand_model]      # None -> Poisson
 
         self.dates       = s["dates"]
@@ -97,6 +100,7 @@ class HotelEnv(gym.Env):
         rng = self.np_random
         self.t = 0
         self.committed = np.zeros(self.n_days + 40, dtype=int)
+        self.committed[:self.n_days] = self.offline          # the real offline stays
         # The whole season's randomness, fixed before any price is set
         self.shock = (rng.gamma(self.k, 1.0 / self.k, size=self.n_days)
                       if self.k else np.ones(self.n_days))

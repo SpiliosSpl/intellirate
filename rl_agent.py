@@ -25,8 +25,7 @@ SEASON      = 2026
 MODELS      = ["rf", "xgb"]
 MODEL_NAMES = {"rf": "ML1 RF", "xgb": "ML2 XGB"}
 ELASTICITY  = 1.0
-CAPACITY    = None                 # None -> the season's STD rooms (2025: 18, 2026: 17)
-TIMESTEPS   = 300_000              # per algorithm and seed
+TIMESTEPS   = 500_000              # per algorithm and seed
 SEEDS       = [42, 7, 123]
 JOBS        = 3                    # parallel processes: the seeds of one ML x RL train together
 N_EVAL      = 200                  # simulated seasons per policy
@@ -98,16 +97,16 @@ def agent_policy(model):
 
 def summarise(name, df, base, env):
     diff = df["reward"].values - base["reward"].values          # paired
-    days = env.n_days
+    avail = env.online_avail.sum()                              # online room-nights for sale
     return {
         "policy": name,
         "revenue": df["revenue"].mean(),
         "vs_hotel_%": 100 * diff.mean() / base["reward"].mean(),
         "vs_hotel_se_%": 100 * diff.std(ddof=1) / np.sqrt(len(diff)) / base["reward"].mean(),
         "room_nights": df["room_nights"].mean(),
-        "occupancy_%": 100 * df["room_nights"].mean() / (env.capacity * days),
+        "occupancy_%": 100 * df["room_nights"].mean() / avail,
         "ADR": df["revenue"].mean() / df["room_nights"].mean(),
-        "RevPAR": df["revenue"].mean() / (env.capacity * days),
+        "RevPAR": df["revenue"].mean() / avail,
         "lost_requests": df["lost"].mean(),
     }
 
@@ -217,7 +216,7 @@ def plot_comparison(comp, path, title):
 def run_pipeline(model_name, args):
     world = args.common_world or model_name
     env_kwargs = dict(season=args.season, demand_model=world, forecast_model=model_name,
-                      elasticity=args.elasticity, capacity=CAPACITY)
+                      elasticity=args.elasticity)
     label = MODEL_NAMES[model_name] + (f" (world {MODEL_NAMES[world]})"
                                        if args.common_world else "")
     out_dir = (f"results_{args.season}_{model_name}_e{args.elasticity}"
@@ -235,7 +234,8 @@ def run_pipeline(model_name, args):
     out("=" * 72,
         f" {label} + {algo_names} | STD | season {args.season} | "
         f"{env.dates[0].date()} -> {env.dates[-1].date()} ({env.n_days} days)",
-        f" {env.capacity} rooms, elasticity {args.elasticity}, BAR levels "
+        f" {env.capacity} rooms ({env.online_avail.mean():.1f} online per night), "
+        f"elasticity {args.elasticity}, BAR levels "
         f"EUR {env.prices[0]:.0f}-{env.prices[-1]:.0f} (reference: median BAR EUR {env.p_ref:.0f})",
         "=" * 72)
 

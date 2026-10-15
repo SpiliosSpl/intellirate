@@ -1,3 +1,5 @@
+import csv
+import re
 import warnings
 
 import numpy as np
@@ -34,6 +36,10 @@ PII_COLUMNS = ["First Name", "Last Name", "Email", "Telephone", "Card",
 BAR_DAILY_PATH    = "bar_daily.csv"     # double-occupancy BAR per stay night
 BAR_BOOKINGS_PATH = "bar_bookings.csv"  # BAR each booking was priced from
 
+# Hotel PMS export: every STD stay, online and offline. Only arrival, departure
+# and room are read, to find the rooms left for online sale each night.
+PMS_PATH = "hotel_pms_data.csv"
+
 RF_PARAMS = dict(n_estimators=500, min_samples_leaf=3, max_features=0.6,
                  random_state=42, n_jobs=-1)
 # Poisson objective: the natural loss for daily counts. Shallow trees and a
@@ -46,6 +52,10 @@ MODEL_NAMES = {"rf": "ML1 Random Forest", "xgb": "ML2 XGBoost (Poisson)"}
 
 N_FOLDS = 5                          # blocked by ISO week (no leakage in time)
 MIN_PROFILES_PER_MONTH = 20          # else fall back to the whole season
+
+CALIB_SEASONS = 50                   # simulated seasons per calibration round
+CALIB_SEED0   = 200_000              # never used by training or evaluation
+CALIB_TOL     = 0.005                # simulated vs real room-nights
 
 
 def make_model(name):
@@ -95,6 +105,38 @@ def load_bar(bk):
         raise ValueError(f"{bar_ref.isna().sum()} bookings have no BAR: re-run python bar_rates.py "
                          "(BOOKINGS.xlsx or the rate files changed)")
     return daily, bar_ref.values
+
+
+def load_pms(path=PMS_PATH):
+    """Every STD stay in the hotel PMS, online and offline: arrival, departure
+    and room only (one room per row). Nothing else in the file is used. Some
+    rows carry one stray empty field after the arrival date."""
+    with open(path, encoding="cp1253", newline="") as fh:
+        rows = list(csv.reader(fh, delimiter=";"))
+    is_date = re.compile(r"\d{1,2}/\d{1,2}/\d{4}").fullmatch
+    stays = [[v for v in r[1:5] if v][:3] for r in rows if len(r) >= 10 and is_date(r[1])]
+    pms = pd.DataFrame(stays, columns=["arrival", "departure", "room"])
+    for col in ("arrival", "departure"):
+        pms[col] = pd.to_datetime(pms[col], format="%d/%m/%Y")
+    pms["rooms"] = 1
+    return pms
+
+
+def nightly_rooms(stays):
+    """Rooms occupied each night by stays (arrival, departure, rooms)."""
+    stays = stays.reset_index(drop=True)
+    s = stays.loc[stays.index.repeat((stays["departure"] - stays["arrival"]).dt.days)]
+    night = s["arrival"] + pd.to_timedelta(s.groupby(level=0).cumcount(), unit="D")
+    return s["rooms"].groupby(night.values).sum()
+
+
+def online_availability(bk, pms, dates, capacity):
+    """Rooms left for online sale each night. Offline stays are the PMS stays
+    not in the channel manager: capacity - (PMS rooms - confirmed online
+    rooms), clipped to [0, capacity]."""
+    online = nightly_rooms(bk[bk["is_cancelled"] == 0]).reindex(dates, fill_value=0)
+    offline = (nightly_rooms(pms).reindex(dates, fill_value=0) - online).clip(0, capacity)
+    return (capacity - offline).to_numpy(int)
 
 
 # =============================================================================
@@ -234,7 +276,7 @@ def train_models(daily):
 # 4. SIMULATION DATA
 # =============================================================================
 
-def build_sim_data(bk, daily, results):
+def build_sim_data(bk, daily, results, pms):
     daily = daily.copy()
     for name, r in results.items():
         daily[f"true_{name}"] = np.maximum(r["fit"], 0.01)
@@ -263,6 +305,7 @@ def build_sim_data(bk, daily, results):
         ok = s[s["is_cancelled"] == 0]
         seasons[season] = {
             "capacity":        CAPACITY[season],
+            "online_avail":    online_availability(bk, pms, d.index, CAPACITY[season]),
             "dispersion_k":    {n: r["k_world"][season] for n, r in results.items()},
             "dates":           d.index,
             "lambda_true":     {n: d[f"true_{n}"].values for n in results},
@@ -281,6 +324,34 @@ def build_sim_data(bk, daily, results):
             },
         }
     return {"seasons": seasons, "models": MODEL_NAMES}
+
+
+def calibrate_to_availability(sim):
+    """Rescale each world's demand so that the simulator, at the hotel's own
+    prices and under the real online availability, sells the real number of
+    room-nights. Demand on nights closed online was never recorded, so the
+    season-total scaling alone under-books. At the hotel's price the price
+    response cancels, so the factor does not depend on the elasticity.
+    Returns {(season, model): (factor, simulated / real - 1)}."""
+    from hotel_season_env import HotelEnv      # the env reads sim_data: import here
+    out = {}
+    for season, s in sim["seasons"].items():
+        for name in s["lambda_true"]:
+            factor = 1.0
+            for _ in range(10):
+                env = HotelEnv(season, name, sim=sim)
+                sold = 0
+                for i in range(CALIB_SEASONS):
+                    env.reset(seed=CALIB_SEED0 + i)
+                    for t in range(env.n_days):
+                        sold += env.step_price(env.hotel_price[t])[4]["room_nights"]
+                ratio = s["actual"]["room_nights"] / (sold / CALIB_SEASONS)
+                if abs(ratio - 1) < CALIB_TOL:
+                    break
+                s["lambda_true"][name] = s["lambda_true"][name] * ratio
+                factor *= ratio
+            out[season, name] = (factor, 1 / ratio - 1)
+    return out
 
 # ==================plotting====================
 def plot_fit(daily, results, path="demand_fit.png"):
@@ -313,6 +384,7 @@ def plot_fit(daily, results, path="demand_fit.png"):
 if __name__ == "__main__":
     bk, export_date = load_raw()
     bar_daily, bk["bar_ref"] = load_bar(bk)
+    pms = load_pms()
     print("=" * 66)
     print(f"  Bookings: {len(bk)} STD, summer arrivals {SUMMER[0]} -> {SUMMER[1]} "
           f"(export date {export_date.date()}; later stay dates excluded)")
@@ -327,7 +399,22 @@ if __name__ == "__main__":
     print()
 
     results = train_models(daily)
-    sim = build_sim_data(bk, daily, results)
+    sim = build_sim_data(bk, daily, results, pms)
+    calib = calibrate_to_availability(sim)
+    print("  Online availability: capacity - (PMS rooms - confirmed online rooms)")
+    for season, s in sim["seasons"].items():
+        a = s["online_avail"]
+        ok = bk[(bk["season"] == season) & (bk["is_cancelled"] == 0)]
+        sold = nightly_rooms(ok).reindex(s["dates"], fill_value=0).values
+        print(f"  Season {season}: {a.mean():.1f} of {s['capacity']} rooms online per night, "
+              f"{(a == 0).sum()} nights closed, {(a <= 3).sum()} with <= 3 rooms, "
+              f"{(s['capacity'] - a).sum()} offline room-nights; "
+              f"real online sales above it on {(sold > a).sum()} nights")
+        for name in s["lambda_true"]:
+            f, err = calib[season, name]
+            print(f"    {name}: demand x {f:.3f} so the simulator sells the real season "
+                  f"(hotel prices: {err:+.1%} room-nights)")
+    print()
 
     joblib.dump({"models": {n: r["model"] for n, r in results.items()},
                  "features": FEATURES}, "demand_models.pkl")
