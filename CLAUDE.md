@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-IntelliRate is a thesis project (University of the Peloponnese, ECE) that dynamically prices hotel rooms. It reconstructs the hotel's Best Available Rate (BAR) from real bookings, fits ML demand models to them, and then trains RL agents (PPO and DQN; a Double DQN is planned) in a simulator built from those models. It compares each ML model × RL algorithm combination with the hotel's actual prices and with the best fixed price.
+IntelliRate is a thesis project (University of the Peloponnese, ECE) that dynamically prices hotel rooms. It reconstructs the hotel's Best Available Rate (BAR) from real bookings, fits ML demand models to them, and then trains RL agents (PPO and Double DQN) in a simulator built from those models. It compares each ML model × RL algorithm combination with the hotel's actual prices and with the best fixed price.
 
 ## Environment and commands
 
@@ -25,8 +25,8 @@ python rl_agent.py             # sim_data.pkl -> results_<season>_<model>_e<elas
 
 Useful `rl_agent.py` flags for quick or partial runs:
 - `--models rf` (or `xgb`) runs only one pipeline.
-- `--algos ppo` (or `dqn`) trains only one RL algorithm (default: all keys in `ALGOS`).
-- `--timesteps 20000 --seeds 42 --no-sensitivity` gives a fast smoke run (the default is 300k steps × 3 seeds for each algorithm, plus a sensitivity sweep). Note that a smoke run overwrites the `results_*` / `comparison_*` outputs of a full run with the same season, elasticity and world.
+- `--algos ppo` (or `ddqn`) trains only one RL algorithm (default: all keys in `ALGOS`).
+- `--timesteps 20000 --seeds 42 --no-sensitivity` gives a fast smoke run (the default is 500k steps × 3 seeds for each algorithm, plus a sensitivity sweep). Note that a smoke run overwrites the `results_*` / `comparison_*` outputs of a full run with the same season, elasticity and world.
 - `--season 2025` and `--elasticity 1.2` change the scenario.
 - `--common-world rf` makes every pipeline use the same "true" demand model while each agent keeps its own forecast. The output directories and tags get a `_world-<m>` suffix.
 - `--jobs 3` (the default) trains the seeds of each ML × RL combination in parallel processes, each with one torch thread. Parallelism is per seed, so at most `len(--seeds)` processes run. `--jobs 1` runs sequentially and gives identical results. A GPU doesn't help here: the networks are tiny and the bottleneck is Python overhead per step. Running all ML × RL × seed jobs in one pool (more seeds on more cores) is planned.
@@ -66,7 +66,8 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    - Baselines use `step_price(price)` to pass an arbitrary price, for example the hotel's BAR.
 
 3. **[rl_agent.py](rl_agent.py)** runs one pipeline per ML model, and each pipeline trains every RL algorithm:
-   - RL algorithms live in the `ALGOS` registry (`key -> (SB3 class, params, display name)`). `train_agent` is generic: SB3, CPU, `VecNormalize` on reward only, which is also valid for DQN because off-policy SB3 normalises replay-buffer rewards at sample time. To add an algorithm, add a registry entry. The planned Double DQN is meant to be a `DQN` subclass that overrides `train()`, reusing `DQN_PARAMS` unchanged. Every DQN hyperparameter is set explicitly so that the TD target is the only difference between the two.
+   - RL algorithms live in the `ALGOS` registry (`key -> (SB3 class, params, display name)`). `train_agent` is generic: SB3, CPU, `VecNormalize` on reward only, which is also valid for Double DQN because off-policy SB3 normalises replay-buffer rewards at sample time. To add an algorithm, add a registry entry.
+   - Double DQN (`"ddqn"`, which replaced DQN) is `DoubleDQN(DQN)`. SB3 has no Double DQN, so it overrides `train()`, copied from SB3 2.8.0's `DQN.train` (re-check it after an SB3 upgrade). Only the next-state value changes (`next_q_values`): the online net selects the action and the target net evaluates it. `DQN_PARAMS` is unchanged from the DQN it replaced, so the TD target is the only difference. The Experiment findings section has the comparison with DQN.
    - It validates the simulator: the hotel's prices in the sim are compared with the real season. Occupancy and RevPAR in `results.csv` are over the online available room-nights.
    - It finds the best fixed price once per ML model, then trains each algorithm for each seed.
    - It evaluates every policy on the same `N_EVAL` seasons, seeded from `EVAL_SEED0 = 100000` so they are never seen in training.
@@ -95,7 +96,26 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
 - **Multipliers:** 0.75–1.25× in 5% steps is fine at ε = 1. Widening the range doesn't help the RL; a narrower range (≈ 0.90–1.20×) halved the RL loss in a 2-seed test. The sensitivity sweep's best-fixed search is capped by the grid at ε ≤ 0.8 and should use a wider grid there.
 - **Extended observation** (7-night committed rooms, 7-day forecast, yesterday's price) and a **variable cost** (€20/room-night, profit reward) gave no consistent RL improvement in the 17-room simulator. Cost raises the best price level (1.15×), which is a level effect.
 - **Capacity is the key lever.** Lowering a constant capacity raises the gain only as fast as simulator realism falls; 14 (the online maximum) is defensible but changes little. A per-night online capacity from the availability report gives about +2–5% RevPAR over the hotel, but that simulator under-books the real season by 11–19%. It needs demand correction on sold-out (censored) nights and recalibration to about ±2% before its gains can be reported. (Superseded: the PMS availability below replaced the constant capacity.)
-- **PMS online availability (side-by-side test, 100k steps × 2 seeds, refreshed export):** with real offline stays pre-filled, about 90–100 requests per season are lost at the hotel's prices (constant capacity: about 2). The best fixed price rises to 1.15× and beats the hotel by about +1.75% (constant capacity: about +0.05%), which is a scarcity level effect. RL was still 1.5–2.3% below best fixed at 100k steps, so a full run is needed. With room-nights calibration, sim vs real is bookings +0.2–0.3%, room-nights −0.9% and revenue −1.0 to −1.1%. The gain relies on the recalibration's assumption of unrecorded demand on closed or near-full nights.
+- **PMS online availability vs BOOKINGS-only (full runs, 500k × 3 seeds, refreshed export, same settings):**
+  - **Sim vs real:** PMS gives bookings +0.2–0.3%, room-nights −0.9% and revenue −1.0 to −1.1% (BOOKINGS-only: within 0.4%).
+  - **Lost requests at the hotel's prices:** about 90–100 per season (BOOKINGS-only: about 2).
+  - **Best fixed price:** 1.15×, +1.73% (rf) / +1.77% (xgb) vs hotel. BOOKINGS-only: 1.00–1.05×, +0.05–0.08%. This is a scarcity level effect.
+  - **PPO vs hotel:** +1.51% (rf) / +1.49% (xgb), seed spread 0.1–0.3%. BOOKINGS-only: −0.57 / −0.85%.
+  - **PPO vs best fixed:** −0.22 / −0.27% (BOOKINGS-only: −0.62 / −0.93%), so there is still no day-by-day gain.
+  - **Sensitivity of best fixed vs hotel:**
+
+    | ε | 0.6 | 0.8 | 1.0 | 1.2 | 1.5 |
+    |---|---|---|---|---|---|
+    | PMS | +11% | +6% | +2% | 0% | +1% |
+    | BOOKINGS-only | +8% | +3% | 0% | +1% | +6% |
+
+    With PMS, a lower price can't fill rooms that aren't there, which is why ε = 1.5 gives only +1%.
+  - The gain relies on the recalibration's assumption of unrecorded demand on closed or near-full nights.
+  - The training curves flatten by about 300–400k steps, so 1M steps is expected to add little.
+- **Double DQN vs DQN (PMS, 500k × 3 seeds, same world and evaluation seasons, identical `DQN_PARAMS`):**
+  - **rf:** DQN +0.87 / −0.36 / −1.76% per seed (mean −0.42%, spread 1.07%). Double DQN +1.52 / +1.20 / +0.58% (mean **+1.10%**, spread 0.39%). Every seed improves.
+  - **xgb:** DQN +0.98% (spread 0.31%), Double DQN +0.94% (spread 0.50%), essentially unchanged.
+  - Removing overestimation fixed DQN's instability where it existed. Double DQN is still below PPO (+1.5%) and below best fixed (−0.62 / −0.82%).
 - **Volatility fix (per-season `dispersion_k`):** the world no longer invents busy days (2026: about 0.9 full nights per season at the hotel's prices, down from 1.4–1.5). The best fixed price is +0.06–0.10% over the hotel and a capacity-aware rule adds nothing, so the constant-capacity conclusion holds in a world that matches reality in both totals and variability. The findings above were measured before this fix.
 - **PMS pre-fill test (read-only, preliminary PMS file):** offline stays (groups ≈ 57–63% of STD room-nights, plus complimentary and offline direct) leave ≤ 3 rooms for online on 34 (2026) / 59 (2025) nights. Pre-filling them gives a simple capacity rule about +1% over the hotel, but the simulator then under-books the real online season by 15–17% (date-only matching left 110 online bookings unmatched, so some are double counted, and demand on closed nights is censored). Superseded by the per-night subtraction (no booking matching) plus recalibration above.
 - **Elasticity:** keep 1.0 as the main scenario. Per the hotel, its main competitor is usually 5–15% cheaper for this room type (sometimes more expensive), so ε well below 1 would imply implausible premiums; report about 0.8–1.5 as sensitivity. The data that would most improve results: the hotel's real nightly availability across all channels, and competitor prices per date.

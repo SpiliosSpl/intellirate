@@ -4,6 +4,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
@@ -34,10 +35,9 @@ EVAL_SEED0  = 100_000              # evaluation seasons: never seen in training
 PPO_PARAMS = dict(learning_rate=3e-4, n_steps=2048, batch_size=256,
                   n_epochs=10, gamma=0.99, ent_coef=0.01)
 
-# DQN: every setting is written out (not left to SB3 defaults) so that the
-# Double DQN added later can reuse exactly this dict. The only difference
-# between the two is then the TD target (online net selects, target net
-# evaluates), a subclass of DQN overriding train(). Same network size as PPO.
+# Double DQN: every setting is written out (not left to SB3 defaults). The dict
+# is unchanged from the DQN that Double DQN replaced, so the TD target is the
+# only difference between the two. Same network size as PPO.
 DQN_PARAMS = dict(learning_rate=1e-4, buffer_size=100_000, learning_starts=5_000,
                   batch_size=128, gamma=0.99, train_freq=4, gradient_steps=1,
                   target_update_interval=2_000, tau=1.0,
@@ -45,11 +45,48 @@ DQN_PARAMS = dict(learning_rate=1e-4, buffer_size=100_000, learning_starts=5_000
                   exploration_final_eps=0.02, max_grad_norm=10,
                   policy_kwargs=dict(net_arch=[64, 64]))
 
+
+
+class DoubleDQN(DQN):
+    def next_q_values(self, next_obs):
+        next_actions = self.q_net(next_obs).argmax(dim=1, keepdim=True)
+        return torch.gather(self.q_net_target(next_obs), dim=1, index=next_actions)
+
+    def train(self, gradient_steps, batch_size=100):
+        self.policy.set_training_mode(True)
+        self._update_learning_rate(self.policy.optimizer)
+
+        losses = []
+        for _ in range(gradient_steps):
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            # For n-step replay, discount factor is gamma**n_steps (when no early termination)
+            discounts = replay_data.discounts if replay_data.discounts is not None else self.gamma
+
+            with torch.no_grad():
+                next_q = self.next_q_values(replay_data.next_observations)
+                target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * next_q
+
+            current_q_values = self.q_net(replay_data.observations)
+            current_q_values = torch.gather(current_q_values, dim=1,
+                                            index=replay_data.actions.long())
+
+            loss = F.smooth_l1_loss(current_q_values, target_q_values)
+            losses.append(loss.item())
+
+            self.policy.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+            self.policy.optimizer.step()
+
+        self._n_updates += gradient_steps
+        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        self.logger.record("train/loss", np.mean(losses))
+
+
 # RL algorithms: key -> (SB3 class, hyperparameters, display name).
-# Double DQN later: "ddqn": (DoubleDQN, DQN_PARAMS, "Double DQN")
 ALGOS = {
     "ppo": (PPO, PPO_PARAMS, "PPO"),
-    "dqn": (DQN, DQN_PARAMS, "DQN"),
+    "ddqn": (DoubleDQN, DQN_PARAMS, "Double DQN"),
 }
 RL_COLOURS = ["#2E75B6", "#8E44AD", "#16A085", "#7F8C8D"]   # by position in --algos
 
@@ -91,7 +128,7 @@ def fixed_policy(action):
 
 
 def agent_policy(model):
-    """Greedy policy of a trained SB3 agent (PPO: mode, DQN: argmax Q)."""
+    """Greedy policy of a trained SB3 agent (PPO: mode, Double DQN: argmax Q)."""
     return lambda env, obs: env.step(int(model.predict(obs, deterministic=True)[0]))
 
 
@@ -124,7 +161,7 @@ def train_agent(algo, seed, log_dir, env_kwargs, timesteps):
     cls, params, _ = ALGOS[algo]
     os.makedirs(log_dir, exist_ok=True)
     # Reward normalisation: off-policy agents store raw rewards in the replay
-    # buffer and normalise them when sampled, so this is valid for DQN too.
+    # buffer and normalise them when sampled, so this is valid for Double DQN too.
     venv = VecNormalize(DummyVecEnv([lambda: Monitor(HotelEnv(**env_kwargs), log_dir)]),
                         norm_obs=False, norm_reward=True, gamma=params["gamma"])
     model = cls("MlpPolicy", venv, seed=seed, verbose=0, device="cpu", **params)
