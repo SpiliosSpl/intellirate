@@ -160,12 +160,16 @@ def find_best_fixed(env, n=N_EVAL):
     return best, means, runs[best]
 
 
-def append_elasticity_log(model_name, args, table, suffix):
-    """Append this run's mean RL revenue and occupancy to the model's log, to
-    track how they change with the elasticity across runs."""
+def append_elasticity_log(model_name, args, table, suffix, best_multiplier):
+    """Append this run's hotel and best fixed revenue and the mean RL revenue
+    and occupancy to the model's log, to track how they change with the
+    elasticity across runs."""
     row = {"timestamp": datetime.now().isoformat(timespec="seconds"),
            "season": args.season, "elasticity": args.elasticity,
-           "timesteps": args.timesteps, "seeds": " ".join(map(str, args.seeds))}
+           "timesteps": args.timesteps, "seeds": " ".join(map(str, args.seeds)),
+           "hotel_revenue": table["revenue"].iloc[0],           # rows 0-1: hotel, best fixed
+           "best_fixed_multiplier": best_multiplier,
+           "best_fixed_revenue": table["revenue"].iloc[1]}
     by_policy = table.set_index("policy")
     for algo, (_, _, name) in ALGOS.items():      # every algorithm: a fixed header
         mean = f"{name} mean of {len(args.seeds)} seeds"
@@ -175,7 +179,8 @@ def append_elasticity_log(model_name, args, table, suffix):
     path = ELASTICITY_LOG.format(model=model_name + suffix)
     new = not os.path.exists(path)
     if not new and pd.read_csv(path, nrows=0).columns.tolist() != list(row):
-        raise ValueError(f"{path} has different columns (ALGOS changed?): rename or delete it")
+        raise ValueError(f"{path} has different columns (ALGOS or the log changed?): "
+                         "rename or delete it")
     pd.DataFrame([row]).to_csv(path, mode="a", header=new, index=False)
     print(f"Appended to {path}")
 
@@ -396,7 +401,7 @@ def run_pipeline(model_name, args):
                     f"{label} + {algo_names} — price path, one simulated season {args.season}")
     with open(os.path.join(out_dir, "summary.txt"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(log))
-    append_elasticity_log(model_name, args, table, suffix)
+    append_elasticity_log(model_name, args, table, suffix, PRICE_MULTIPLIERS[best])
 
     return comp_rows
 
