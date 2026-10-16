@@ -1,5 +1,6 @@
 import argparse
 import os
+from datetime import datetime
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -93,6 +94,8 @@ RL_COLOURS = ["#2E75B6", "#8E44AD", "#16A085", "#7F8C8D"]   # by position in --a
 SENSITIVITY_ELASTICITIES = [0.6, 0.8, 1.0, 1.2, 1.5]
 SENSITIVITY_N_EVAL       = 100     # seasons per policy (same for hotel and fixed)
 
+ELASTICITY_LOG = "elasticity_log_{model}.csv"   # one row appended per run
+
 
 # =============================================================================
 # POLICY EVALUATION
@@ -155,6 +158,26 @@ def find_best_fixed(env, n=N_EVAL):
     means = [df["reward"].mean() for df in runs]
     best = int(np.argmax(means))
     return best, means, runs[best]
+
+
+def append_elasticity_log(model_name, args, table, suffix):
+    """Append this run's mean RL revenue and occupancy to the model's log, to
+    track how they change with the elasticity across runs."""
+    row = {"timestamp": datetime.now().isoformat(timespec="seconds"),
+           "season": args.season, "elasticity": args.elasticity,
+           "timesteps": args.timesteps, "seeds": " ".join(map(str, args.seeds))}
+    by_policy = table.set_index("policy")
+    for algo, (_, _, name) in ALGOS.items():      # every algorithm: a fixed header
+        mean = f"{name} mean of {len(args.seeds)} seeds"
+        trained = mean in by_policy.index
+        row[f"{algo.upper()}_mean_revenue"] = by_policy.loc[mean, "revenue"] if trained else np.nan
+        row[f"{algo.upper()}_mean_occupancy_%"] = by_policy.loc[mean, "occupancy_%"] if trained else np.nan
+    path = ELASTICITY_LOG.format(model=model_name + suffix)
+    new = not os.path.exists(path)
+    if not new and pd.read_csv(path, nrows=0).columns.tolist() != list(row):
+        raise ValueError(f"{path} has different columns (ALGOS changed?): rename or delete it")
+    pd.DataFrame([row]).to_csv(path, mode="a", header=new, index=False)
+    print(f"Appended to {path}")
 
 
 def train_agent(algo, seed, log_dir, env_kwargs, timesteps):
@@ -256,8 +279,8 @@ def run_pipeline(model_name, args):
                       elasticity=args.elasticity)
     label = MODEL_NAMES[model_name] + (f" (world {MODEL_NAMES[world]})"
                                        if args.common_world else "")
-    out_dir = (f"results_{args.season}_{model_name}_e{args.elasticity}"
-               + (f"_world-{world}" if args.common_world else ""))
+    suffix = f"_world-{world}" if args.common_world else ""
+    out_dir = f"results_{args.season}_{model_name}_e{args.elasticity}{suffix}"
     os.makedirs(out_dir, exist_ok=True)
     log = []
 
@@ -373,6 +396,7 @@ def run_pipeline(model_name, args):
                     f"{label} + {algo_names} — price path, one simulated season {args.season}")
     with open(os.path.join(out_dir, "summary.txt"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(log))
+    append_elasticity_log(model_name, args, table, suffix)
 
     return comp_rows
 

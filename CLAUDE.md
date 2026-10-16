@@ -20,7 +20,7 @@ Run the pipeline in order, from the repo root. All paths are relative to the cur
 ```
 python bar_rates.py            # BOOKINGS.xlsx + rate_rules.csv + rate_occupancy.csv -> bar_daily.csv, bar_bookings.csv, bar_validation.txt, bar_daily.png
 python ml_demand_model.py      # BOOKINGS.xlsx + bar_*.csv + hotel_pms_data.csv -> demand_models.pkl, sim_data.pkl, ml_comparison.csv, demand_fit.png
-python rl_agent.py             # sim_data.pkl -> results_<season>_<model>_e<elasticity>/, comparison_<tag>.csv/.png
+python rl_agent.py             # sim_data.pkl -> results_<season>_<model>_e<elasticity>/, comparison_<tag>.csv/.png, elasticity_log_<model>.csv
 ```
 
 Useful `rl_agent.py` flags for quick or partial runs:
@@ -31,7 +31,7 @@ Useful `rl_agent.py` flags for quick or partial runs:
 - `--common-world rf` makes every pipeline use the same "true" demand model while each agent keeps its own forecast. The output directories and tags get a `_world-<m>` suffix.
 - `--jobs 3` (the default) trains the seeds of each ML × RL combination in parallel processes, each with one torch thread. Parallelism is per seed, so at most `len(--seeds)` processes run. `--jobs 1` runs sequentially and gives identical results. A GPU doesn't help here: the networks are tiny and the bottleneck is Python overhead per step. Running all ML × RL × seed jobs in one pool (more seeds on more cores) is planned.
 
-The repo has no tests, linter or build step. `.gitignore` uses patterns: the private data in any format (`BOOKINGS.*`) and every generated artifact (`*.pkl`, `*.zip`, `bar_*` outputs, `ml_comparison.csv`, `demand_fit.png`, `results_*/`, `comparison_*`, `logs/`) are ignored, so runs for any season, elasticity or world stay out of the repo. The two rate config files (`rate_rules.csv`, `rate_occupancy.csv`) are tracked. The pipeline runs without warnings (the Excel export's openpyxl style warning is silenced in `load_raw`); keep it that way rather than running with `-W ignore`.
+The repo has no tests, linter or build step. `.gitignore` uses patterns: the private data in any format (`BOOKINGS.*`) and every generated artifact (`*.pkl`, `*.zip`, `bar_*` outputs, `ml_comparison.csv`, `demand_fit.png`, `results_*/`, `comparison_*`, `elasticity_log_*.csv`, `logs/`) are ignored, so runs for any season, elasticity or world stay out of the repo. The two rate config files (`rate_rules.csv`, `rate_occupancy.csv`) are tracked. The pipeline runs without warnings (the Excel export's openpyxl style warning is silenced in `load_raw`); keep it that way rather than running with `-W ignore`.
 
 **Testing rule: tests, checks and experiments must not make any permanent change to the repo's files unless the user explicitly says so.** That covers code, configs and docs, and also the generated outputs (`bar_*`, `*.pkl`, `ml_comparison.csv`, plots, `results_*`, `comparison_*`). Run them on a copy of the project in the scratch directory (copy the `.py` files, the two rate CSVs, `BOOKINGS.xlsx` and any inputs needed), patch only that copy, and report before applying anything. The rule also means no smoke runs of `rl_agent.py` in the repo, because they overwrite full-run results. Applying a change only after the user approves it, and then regenerating the outputs it requires, is fine.
 
@@ -74,6 +74,7 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    - It reports the gain over the hotel split into a price-*level* effect (best fixed vs hotel, driven by the elasticity assumption) and a *day-by-day* effect per algorithm (RL vs best fixed). A negative day-by-day number means the agent hasn't converged.
    - It also sweeps elasticity for the best fixed price, with no training.
    - Per ML model it writes `results_*/` containing `results.csv`, `summary.txt`, `learning_curve_<algo>.png`, `price_path.png` and `<algo>_seed<n>.zip`. `comparison_<tag>.csv/.png` gets one row per ML × RL combination, with `rl_*` columns.
+   - Every run appends one row per ML model to `elasticity_log_<model>.csv` (`append_elasticity_log`). Each row has the timestamp, season, elasticity, timesteps and seeds, plus each algorithm's mean-of-seeds revenue and occupancy, taken from `results.csv`. It tracks results across runs at different `--elasticity` values. A rerun adds a row instead of replacing one, and a skipped algorithm leaves its columns empty. If the log's columns no longer match `ALGOS`, the run fails instead of appending. Runs in the repo append to it too, which is another reason to keep smoke runs in a scratch copy.
 
 ## Booking data and rates
 
@@ -116,6 +117,15 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
   - **rf:** DQN +0.87 / −0.36 / −1.76% per seed (mean −0.42%, spread 1.07%). Double DQN +1.52 / +1.20 / +0.58% (mean **+1.10%**, spread 0.39%). Every seed improves.
   - **xgb:** DQN +0.98% (spread 0.31%), Double DQN +0.94% (spread 0.50%), essentially unchanged.
   - Removing overestimation fixed DQN's instability where it existed. Double DQN is still below PPO (+1.5%) and below best fixed (−0.62 / −0.82%).
+- **7-night observation under PMS scarcity (scratch test, not applied; 500k × 3 seeds, same world and evaluation seasons):**
+  - **The test:** today's forecast and committed rooms for tonight and tomorrow were replaced with committed rooms (offline + sold) and the forecast for the next 7 nights (9 → 20 dims).
+  - **Result: no gain.**
+    - PPO: +1.49 / +1.48% vs hotel, against +1.51 / +1.49% with 9 dims.
+    - Double DQN: rf +1.07% (was +1.10%), xgb +0.61% (was +0.94%, within its 0.5 seed spread).
+    - Both stay below best fixed (PPO −0.23 / −0.28%).
+    - The 20-dim agents learn slightly faster early but level off at the same revenue.
+  - **Why:** every episode uses the same offline calendar, so the calendar features already encode upcoming group blocks. Stays are mostly one night (mean 1.26), so tonight's free rooms carry almost all the signal.
+  - The observation stays at 9 dims. The agents' gap to best fixed is not caused by missing information about future scarcity. Next test: an upper-bound benchmark (perfect foresight or a capacity-aware rule) to measure how much day-by-day value the simulator holds.
 - **Volatility fix (per-season `dispersion_k`):** the world no longer invents busy days (2026: about 0.9 full nights per season at the hotel's prices, down from 1.4–1.5). The best fixed price is +0.06–0.10% over the hotel and a capacity-aware rule adds nothing, so the constant-capacity conclusion holds in a world that matches reality in both totals and variability. The findings above were measured before this fix.
 - **PMS pre-fill test (read-only, preliminary PMS file):** offline stays (groups ≈ 57–63% of STD room-nights, plus complimentary and offline direct) leave ≤ 3 rooms for online on 34 (2026) / 59 (2025) nights. Pre-filling them gives a simple capacity rule about +1% over the hotel, but the simulator then under-books the real online season by 15–17% (date-only matching left 110 online bookings unmatched, so some are double counted, and demand on closed nights is censored). Superseded by the per-night subtraction (no booking matching) plus recalibration above.
 - **Elasticity:** keep 1.0 as the main scenario. Per the hotel, its main competitor is usually 5–15% cheaper for this room type (sometimes more expensive), so ε well below 1 would imply implausible premiums; report about 0.8–1.5 as sensitivity. The data that would most improve results: the hotel's real nightly availability across all channels, and competitor prices per date.
@@ -126,7 +136,7 @@ Cross-file contracts: `bar_rates.py` imports `load_raw`, `SEASONS` and `SUMMER` 
 
 None of these is implemented. They are recorded as directions and as limitations for the thesis.
 - **Booking lead time:** one step is one arrival date with one price, so every request for a night arrives at once. Spreading requests over a booking window (built from the real lead times in BOOKINGS) and letting the agent reprice would be the biggest gain in realism. It needs a new env design.
-- **7-night availability in the observation:** the agent sees only committed rooms today and tomorrow, not upcoming group blocks.
+- **7-night availability in the observation:** tested under PMS scarcity with no gain (see the findings). Worth revisiting only together with varying availability between episodes.
 - **Learned price response:** the ML models never see price, and the elasticity in `g(p)` is assumed. Competitor prices per date would make it possible to estimate it.
 - **Varying availability between episodes:** every episode uses the same real offline calendar, so generalisation to other group calendars is untested.
 - **Per-night censoring correction:** demand on nights closed online is unrecorded, and the recalibration uses one factor per season and model.
