@@ -19,7 +19,7 @@ Run the pipeline in order, from the repo root. All paths are relative to the cur
 
 ```
 python bar_rates.py            # BOOKINGS.xlsx + rate_rules.csv + rate_occupancy.csv -> bar_daily.csv, bar_bookings.csv, bar_validation.txt, bar_daily.png
-python ml_demand_model.py      # BOOKINGS.xlsx + bar_*.csv + hotel_pms_data.csv -> demand_models.pkl, sim_data.pkl, ml_comparison.csv, demand_fit.png
+python ml_demand_model.py      # BOOKINGS.xlsx + bar_*.csv + hotel_pms_data.csv -> demand_models.pkl, sim_data.pkl, ml_comparison.csv, ml_cv_grid.csv, demand_fit.png
 python rl_agent.py             # sim_data.pkl -> results_<season>_<model>_e<elasticity>/, comparison_<tag>.csv/.png, elasticity_log_<model>.csv
 ```
 
@@ -31,7 +31,7 @@ Useful `rl_agent.py` flags for quick or partial runs:
 - `--common-world rf` makes every pipeline use the same "true" demand model while each agent keeps its own forecast. The output directories and tags get a `_world-<m>` suffix.
 - `--jobs 3` (the default) trains the seeds of each ML × RL combination in parallel processes, each with one torch thread. Parallelism is per seed, so at most `len(--seeds)` processes run. `--jobs 1` runs sequentially and gives identical results. A GPU doesn't help here: the networks are tiny and the bottleneck is Python overhead per step. Running all ML × RL × seed jobs in one pool (more seeds on more cores) is planned.
 
-The repo has no tests, linter or build step. `.gitignore` uses patterns: the private data in any format (`BOOKINGS.*`) and every generated artifact (`*.pkl`, `*.zip`, `bar_*` outputs, `ml_comparison.csv`, `demand_fit.png`, `results_*/`, `comparison_*`, `elasticity_log_*.csv`, `logs/`) are ignored, so runs for any season, elasticity or world stay out of the repo. The two rate config files (`rate_rules.csv`, `rate_occupancy.csv`) are tracked. The pipeline runs without warnings (the Excel export's openpyxl style warning is silenced in `load_raw`); keep it that way rather than running with `-W ignore`.
+The repo has no tests, linter or build step. `.gitignore` uses patterns: the private data in any format (`BOOKINGS.*`) and every generated artifact (`*.pkl`, `*.zip`, `bar_*` outputs, `ml_comparison.csv`, `ml_cv_grid.csv`, `demand_fit.png`, `results_*/`, `comparison_*`, `elasticity_log_*.csv`, `logs/`) are ignored, so runs for any season, elasticity or world stay out of the repo. The two rate config files (`rate_rules.csv`, `rate_occupancy.csv`) are tracked. The pipeline runs without warnings (the Excel export's openpyxl style warning is silenced in `load_raw`); keep it that way rather than running with `-W ignore`.
 
 **Testing rule: tests, checks and experiments must not make any permanent change to the repo's files unless the user explicitly says so.** That covers code, configs and docs, and also the generated outputs (`bar_*`, `*.pkl`, `ml_comparison.csv`, plots, `results_*`, `comparison_*`). Run them on a copy of the project in the scratch directory (copy the `.py` files, the two rate CSVs, `BOOKINGS.xlsx` and any inputs needed), patch only that copy, and report before applying anything. The rule also means no smoke runs of `rl_agent.py` in the repo, because they overwrite full-run results. Applying a change only after the user approves it, and then regenerating the outputs it requires, is fine.
 
@@ -47,11 +47,27 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    - Double price levels count only when seen on ≥ 2 channel groups. Multi-night stays are tested against, and split by, the one-night-stay BAR (never against themselves). The daily BAR is the weighted median per stay night (cancelled bookings included).
    - Outputs `bar_daily.csv` (BAR per night, `source` observed / interpolated / filled), `bar_bookings.csv` (per booking: rules, occupancy, inference method, `bar`, `bar_ref`), and `bar_validation.txt` / `bar_daily.png`.
 
-1. **[ml_demand_model.py](ml_demand_model.py)** loads `BOOKINGS.xlsx`, drops PII columns, and keeps room type `STD`, seasons 2025/2026, summer arrivals and arrivals on or before the export date. It then builds a daily table of booking *requests* (cancelled bookings included), the hotel price (the daily BAR from `bar_daily.csv`, not smoothed), and calendar/holiday features. The holidays are Greek: Orthodox Easter, Whit Monday and national days. It trains RF and XGBoost (Poisson objective) with `GroupKFold` blocked by ISO week and compares them against a season-month mean baseline. For each model it stores:
-   - `lambda_true`: the full-data fit, rescaled so that each season's total matches the real total. It is then recalibrated by `calibrate_to_availability`: one factor per season and model (≈ 1.14–1.19), chosen so that the simulator, at the hotel's prices and under the real online availability, sells the real number of room-nights (within 0.5%). Demand on nights closed online was never recorded. The factor does not depend on elasticity. It drives the simulated "world".
+1. **[ml_demand_model.py](ml_demand_model.py)** loads `BOOKINGS.xlsx`, drops PII columns, and keeps room type `STD`, seasons 2025/2026, summer arrivals and arrivals on or before the export date. It then builds a daily table of booking *requests* (cancelled bookings included), the hotel price (the daily BAR from `bar_daily.csv`, not smoothed), and calendar/holiday features. The holidays are Greek: Orthodox Easter, Whit Monday and national days. `add_availability` adds `online_avail` and `censored` (sold out or closed online: `sold ≥ online_avail`; 41 nights in 2025, 34 in 2026). Censored nights stay in training but are never scored, because their demand above the rooms on sale was never recorded.
+
+   RF and XGBoost (Poisson objective) each play **two roles with separate settings** (protocol "E revised", see the ML validation finding):
+   - **Forecaster** (what the agent sees): settings from `GRID`, chosen only inside `TUNE_SEASON` = 2025 by `GroupKFold` blocked by ISO week, scored on uncensored days, best mean CV deviance (currently rf `min_samples_leaf=20, max_features=1.0`; xgb `max_depth=1, n_estimators=600`). It is then refit on 2025 and tested **once** on all of `TEST_SEASON` = 2026 (161 uncensored days) against the 2025 month mean, with 95% CIs from resampling whole ISO weeks. Out of time, neither model beats that baseline (gain CIs include 0); the level is about 0.54 of actual, but the env shows the agent only the pattern.
+   - **World** (`lambda_true`): `WORLD_PARAMS` (rf `min_samples_leaf=3, max_features=0.6`; xgb `max_depth=3, n_estimators=400`), fitted on both seasons. It describes what happened, so it keeps the real day-of-week, holiday and peak structure; forecast-tuned settings would smooth it away.
+   - `ml_comparison.csv` has one row per `evaluation`: `test_2026`, `baseline` and `pooled_cv_reference`. The last is the old pooled GroupKFold with neighbouring 2026 weeks in training: optimistic (gain +1.0), so report it only as an upper bound. `ml_cv_grid.csv` has the CV score of every config.
+   - **Guardrails (the run fails):**
+     - **G1:** the tune and test seasons split the table, settings are chosen on `TUNE_SEASON` rows only, and every forecast comes from a model that never saw that date.
+     - **G2:** at least `MIN_TEST_DAYS` uncensored test days.
+     - **G3:** the world's daily variance matches the real one within `WORLD_VAR_TOL` (1%).
+     - **G4:** the calibration converges within `CALIB_TOL`.
+   - **Flagged checks (`!!!`, the run continues):**
+     - a chosen config at an edge of `GRID` that is not a natural limit;
+     - a forecaster significantly worse than the baseline;
+     - a world with daily Spearman < 0.5, or any month outside 0.8–1.25 × actual before calibration.
+
+   For each model it stores:
+   - `lambda_true`: the world fit, rescaled so that each season's total matches the real total. It is then recalibrated by `calibrate_to_availability`: one factor per season and model (≈ 1.14–1.19), chosen so that the simulator, at the hotel's prices and under the real online availability, sells the real number of room-nights (within 0.5%). Demand on nights closed online was never recorded. The factor does not depend on elasticity. It drives the simulated "world".
    - `online_avail`: rooms on sale online each night, `capacity − (PMS rooms − confirmed BOOKINGS rooms)` clipped to [0, capacity] (`load_pms`, `online_availability`). 2026: on average 10.4 of 17 rooms, with 11 nights closed. 2025: 8.8 of 18, with 15 nights closed.
-   - `lambda_forecast`: out-of-fold predictions. The agent sees these as its forecast.
-   - `dispersion_k`: the negative-binomial overdispersion of the simulated world's gamma shocks, **one per season and model**, stored in `seasons[year]["dispersion_k"][model]`. `None` means pure Poisson. Per season it is chosen so that the world's total daily variance equals the real one, `Var(y) = E[fit] + Var(fit) + E[fit²]/k`, because the in-sample fit already holds part of the data's noise. This matches the real daily variance within ±5% in both seasons. (Taking `k` from the OOF residuals, as originally, counted that noise twice and made the world 24–59% more volatile than reality, with about twice as many full nights. A single shared `k` left 2026 −7 to −10% and 2025 +17 to +25%.) Current values: 2026 ≈ 4.2 (rf) / 4.3 (xgb); 2025 xgb ≈ 25 and rf `None`, because the rf in-sample fit already carries all of 2025's variance. The `NB k` column in `ml_comparison.csv` still reports the OOF value, which describes forecast error, not the world.
+   - `lambda_forecast`: the forecaster's predictions, never in-sample. 2025 is out-of-fold, and 2026 comes from the model trained on 2025. The agent sees these as its forecast.
+   - `dispersion_k`: the negative-binomial overdispersion of the simulated world's gamma shocks, **one per season and model**, stored in `seasons[year]["dispersion_k"][model]`. `None` means pure Poisson. Per season it is chosen so that the world's total daily variance equals the real one, `Var(y) = E[fit] + Var(fit) + E[fit²]/k`, because the in-sample fit already holds part of the data's noise. It is computed on the fit **after** the per-season rescale, so the match is exact (guardrail G3). (Taking `k` from the OOF residuals, as originally, counted that noise twice and made the world 24–59% more volatile than reality. A single shared `k` left 2026 −7 to −10% and 2025 +17 to +25%. Computing it before the rescale left up to 3% off.) Current values: 2026 ≈ 4.6 (rf) / 4.2 (xgb); 2025 xgb ≈ 16 and rf `None`, because the rf in-sample fit already carries all of 2025's variance. The `dispersion_k` column in `ml_comparison.csv` is the forecaster's 2025 OOF value: it sets the 80% interval coverage and describes forecast error, not the world.
    - Per-month pools of real booking profiles (rooms, nights, Total, orig_price, cancelled). `orig_price` is the booking's own BAR (`bar_ref`), so scaling `Total` to another BAR keeps the guest's occupancy, channel and plan factors. A month with fewer than 20 profiles falls back to the season pool.
 
    Everything goes into `sim_data.pkl`, keyed by `seasons[year]`.
@@ -83,7 +99,7 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
 - Rate parity across channels. NR is −10% everywhere. Booking.com Genius (−10%, flagged "Genius Booker" in `Channel Notes for Hotelier`), the Booking.com Last Minute Deal (−5%, in `Room Type Name`), the Expedia promos in `Rate` (Blue Member −10% in 2025, Member / Mobile −7% in 2026) and every other promo stack by multiplication. 2025 website: permanent −12% direct offer. 2026 website: member programme (`SmartGuest`) −10%, or −14.5% for bookings made from 1 Sep 2026 (those rates are rounded to the euro).
 - Occupancy pricing: see `rate_occupancy.csv`. BAR always means the double-occupancy BAR.
 - Flexible bookings cancel at a rate of about 36%, NR bookings at about 2%. `Cancel Fee` is always 0. In the simulator a cancelled profile earns nothing and never holds capacity.
-- The 2026 season is cut off at the export date (14 Oct, since the BOOKINGS refresh; it was 27 Sep), while 2025 runs to 31 Oct. The `results_*` / `comparison_*` outputs from before the PMS change are stale until `rl_agent.py` is re-run. The daily table starts at each season's first actual arrival (3 Apr in both seasons), not on 1 Apr.
+- The 2026 season is cut off at the export date (14 Oct, since the BOOKINGS refresh; it was 27 Sep), while 2025 runs to 31 Oct. The daily table starts at each season's first actual arrival (3 Apr in both seasons), not on 1 Apr.
 - The hotel's online booking systems opened late in 2025, on about 1 Apr. About a third of the 2025 demand is therefore unrecorded, including about three quarters of April. **Decision: 2025 is kept as recorded, with no correction.** Treat 2026 as the main RL season, and describe 2025 as a limitation rather than fixing it.
 
 Other data files. Only the PMS file is used by the pipeline, and every private one is gitignored by pattern (`BOOKINGS.*`, `hotel_pms_data.*`, `avl-status*`, `kaggle_data.*`). `avl-status*` and `kaggle_data.*` are currently kept outside the repo folder.
@@ -128,6 +144,73 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
   - The observation stays at 9 dims. The agents' gap to best fixed is not caused by missing information about future scarcity. Next test: an upper-bound benchmark (perfect foresight or a capacity-aware rule) to measure how much day-by-day value the simulator holds.
 - **Volatility fix (per-season `dispersion_k`):** the world no longer invents busy days (2026: about 0.9 full nights per season at the hotel's prices, down from 1.4–1.5). The best fixed price is +0.06–0.10% over the hotel and a capacity-aware rule adds nothing, so the constant-capacity conclusion holds in a world that matches reality in both totals and variability. The findings above were measured before this fix.
 - **PMS pre-fill test (read-only, preliminary PMS file):** offline stays (groups ≈ 57–63% of STD room-nights, plus complimentary and offline direct) leave ≤ 3 rooms for online on 34 (2026) / 59 (2025) nights. Pre-filling them gives a simple capacity rule about +1% over the hotel, but the simulator then under-books the real online season by 15–17% (date-only matching left 110 online bookings unmatched, so some are double counted, and demand on closed nights is censored). Superseded by the per-night subtraction (no booking matching) plus recalibration above.
+- **ML validation protocols (scratch tests; E revised, at the end of this item, is applied in `ml_demand_model.py`):**
+  - **Variants, all scored on uncensored nights:**
+    - **A:** current pooled GroupKFold.
+    - **B1:** 5-fold GroupKFold within 2025 to choose the settings, refit on 2025, test on all 2026.
+    - **B2:** train Apr–Aug 2025, validate Sep–Oct 2025, refit on 2025, test on 2026.
+    - **C:** train 2025 + Apr 2026, validate May–Jun 2026, refit up to 30 Jun, test 1 Jul – 14 Oct 2026.
+    - **D:** 5-fold GroupKFold on 2025 + 2026 up to 30 Jun, refit on that, test 1 Jul – 14 Oct 2026.
+    - **E:** B1 rerun in the second round below; **E revised** in the third round.
+  - **Censored nights:** sold out or closed online (`sold ≥ online_avail`): 41 in 2025, 34 in 2026.
+  - **Out of time, neither model beats the season-month mean on 2026** (Poisson deviance gain CIs include 0; from 15 Aug the baseline is significantly better). A's apparent edge comes from interpolation.
+  - **The error is the level, not the pattern:**
+    - Calendar-only models forecast 2026 at 55–67% of actual, because Jul–Oct 2026 ran 65% above 2025 and trees can't extrapolate that growth, even with spring 2026 in training (C).
+    - The pattern is as good as the baseline's or slightly better. The env normalises the forecast by its maximum, so the agent only sees the pattern.
+  - **C's 48-day validation contradicted its test.**
+  - **B1 and B2 chose the same settings,** so their test results are identical:
+    - with a widened grid, B1/E chooses rf `min_samples_leaf=20, max_features=1.0` and xgb `max_depth=1, n_estimators=600`, about 7% better CV deviance than the current `RF_PARAMS` / `XGB_PARAMS`;
+    - B2 extrapolates to unseen months (rf validation level 1.23) and has only 40 validation days;
+    - B1 is recommended.
+  - **NB intervals are too narrow on 2026:** 80% intervals cover 66–77% of days.
+  - **Pitfalls if censored nights are dropped from training:**
+    - **Rescale:** `build_sim_data` must rescale `lambda_true` to the real total over uncensored nights only. Otherwise the calibration factor rises (2026: 1.23–1.25 instead of falling to 1.14–1.15).
+    - **Baseline:** a month × weekday mean baseline needs shrinkage toward the month mean, because empty cells give deviances of 6–11.
+  - **D vs E (second round, wider grid, same 92 uncensored test nights 1 Jul – 14 Oct 2026):**
+    - D's level is better (0.64 vs 0.59–0.61) and its 80% intervals are calibrated (0.79 vs 0.71). The raw deviance gain over E is +4% (rf) / +2% (xgb), with CIs that include 0.
+    - E's pattern is better (deviance after rescaling to the actual total): rf +3% (n.s.), xgb +9% (significant). The cause is the settings: D picked a deeper xgb (`max_depth=2, n_estimators=200`), while rf settings are the same in both.
+    - Neither beats the 2025 month mean. "2025 month mean × spring 2026/2025 trend" (trend 2.09, inflated by the unrecorded spring 2025) beats both clearly (deviance 2.45 vs about 3.1), although it overshoots the level by 24%.
+  - **Monte Carlo CV (50 splits, 20% held out) changes nothing:** holding out weeks or days chooses the same settings as GroupKFold on D's data. Holding out weeks lowers the CV standard error by about 30%. Holding out days lowers it further only through leakage between neighbouring days. The real issue is a flat score surface: 11–14 configs fall within 1 SE of the best, so D and E's different xgb choices are near-ties.
+  - **Third round: E with the one-SE rule vs E revised vs D (full pipeline runs in scratch):**
+    - **E one-SE (rejected):** the one-SE rule (5 folds on 212 days, SE ≈ 0.13) falls to the simplest corner (rf `min_samples_leaf=50`; xgb depth 1, 100 trees). Used for the world too, it drops day of week and holidays (importance ≈ 0), misses the August peak, and its daily variance is 20–28% off reality (calibration 1.19–1.29).
+    - **The world and the forecaster need different settings.** The forecaster must generalise to an unseen season; the world (`lambda_true`) describes what happened and must keep its day-of-week, holiday and peak structure.
+    - **E revised vs D, same 92 out-of-time nights (1 Jul – 14 Oct 2026):** D is slightly better raw (n.s.), E revised has the better pattern (xgb significantly). Over all of 2026, E revised is fully out of time and on a par with the 2025 month mean. D's 2026 forecast is interpolated for Apr–Jun, so its full-season score is not a forecast.
+    - **Agent view (max-normalised forecast vs actual, 2026):** E revised 0.39–0.40, current (leaky) 0.38, D 0.28–0.36, E one-SE 0.31.
+    - **The current pooled forecast's 2026 gain (+1.0 over the 2025 month mean, significant) is leakage** from neighbouring 2026 weeks, not forecasting skill.
+  - **Chosen protocol: E revised (applied; implementation and guardrails in the Architecture section).**
+    - **Forecaster (`lambda_forecast`):** settings with the best GroupKFold CV score (by ISO week, uncensored days) inside 2025, no one-SE rule. 2025 is out-of-fold, 2026 is predicted by the model trained on 2025. It matches the env, which uses one static forecast per date and shows the agent only its shape.
+    - **Test:** all of 2026 once, on uncensored nights, against the 2025 month mean, with 95% CIs from resampling ISO weeks. Report both this honest score and the pooled one (optimistic).
+    - **World (`lambda_true`):** keep the current `RF_PARAMS` / `XGB_PARAMS` fit on 2025 + 2026. Compute `dispersion_k` on the fit **after** the per-season rescale, so the world's variance matches reality exactly (2026: 4.6 rf / 4.2 xgb; 2025 xgb 16; calibration factors move ≤ 0.6%).
+    - **D:** a one-paragraph robustness check (better level and interval coverage, not pattern). It becomes the realistic choice only if the env re-forecasts during the season (booking lead time).
+    - The sim schema is unchanged; the agent's forecast and `dispersion_k` change, so `rl_agent.py` needs a full rerun. A 20k-step smoke run in scratch was too short to compare the two forecasts (differences −1.2 to +1.1 points, changing sign). Don't pick the protocol by RL revenue, because that selects on the test.
+    - A wider xgb grid (up to 2000 trees) confirmed 600 trees as an interior optimum; the grid now goes to 1000.
+  - **Next step:** add a booking-pace feature (rooms on hand 45 days out; the 2026 median lead time is 45 days, the 75th percentile 89) and compare it with the calendar-only model under the same protocol.
+- **Full RL run on the E revised ML (17 Oct 2026; 500k × seeds 42 / 7 / 123, season 2026, ε = 1.0), compared with the previous full run (16 Oct, pooled-CV forecast):**
+
+  | vs hotel | Before | E revised | Seed spread |
+  |---|---|---|---|
+  | Best fixed rf / xgb | 1.15×, +1.73% / 1.15×, +1.77% | 1.20×, +1.59% / 1.15×, +1.74% | – |
+  | RF + PPO | +1.51% | +1.49% | 0.06 |
+  | RF + Double DQN | +1.10% | +1.03% | 0.26 |
+  | XGB + PPO | +1.49% | +1.37% | 0.42 |
+  | XGB + Double DQN | +0.94% | +1.03% | 0.27 |
+
+  - **The honest forecast costs nothing:** every change (−0.12 to +0.09 points) is within the seed spread and about one paired SE (≈ 0.1). The rf best fixed moved to 1.20× because of the small world change (`dispersion_k` after the rescale); 1.15× and 1.20× are a near-tie. Sim vs real revenue: −0.9 / −1.0%.
+  - **Still no day-by-day gain:**
+    - PPO vs best fixed: −0.11% (rf, was −0.22) / −0.37% (xgb, was −0.27);
+    - Double DQN vs best fixed: −0.55% / −0.69% (was −0.62 / −0.82).
+  - **The agents learn the level, not the pattern.** ADR is 146–155 € against the hotel's 136 €, at occupancy 32–34% against 35.8%, with fewer lost requests. The price paths wander (PPO mostly 184–200 €, with drops to 128–152 € on quiet days) and don't track the forecast.
+  - **The learning curves plateau at about 150–200k steps** and then swing by about ±1,000 €, with seeds overtaking each other. The final checkpoint is effectively a random draw from that band.
+  - **One run beat best fixed:** XGB + PPO seed 7 reached +1.86% against best fixed +1.74%. Picking it after the fact would be selection on the test seasons, so it can't be reported.
+  - **Sensitivity is unchanged:** +11 / +6 / +2 / 0 / +1% at ε = 0.6 / 0.8 / 1.0 / 1.2 / 1.5.
+  - **What the RL validation step must fix:**
+    - seed and checkpoint selection on the reported seasons;
+    - the best fixed price chosen on the same seasons it is reported on;
+    - error bars that ignore the variance between training seeds.
+- **PMS data as demand training data (scratch test, not applied): no.**
+  - Group stays move against online requests (weekly correlation −0.4 to −0.6, also on uncensored nights), and total PMS occupancy carries almost no signal (≈ +0.1).
+  - As a prior-year pattern for 2026, every PMS index is significantly worse than the 2025 online month mean. Older PMS-only seasons (2023–24, no online channel) would therefore not help the demand model.
+  - The offline calendar repeats strongly between years (weekly correlation 0.83, groups 0.87). Older PMS seasons are useful for modelling offline stays (varying availability between episodes), not demand.
 - **Elasticity:** keep 1.0 as the main scenario. Per the hotel, its main competitor is usually 5–15% cheaper for this room type (sometimes more expensive), so ε well below 1 would imply implausible premiums; report about 0.8–1.5 as sensitivity. The data that would most improve results: the hotel's real nightly availability across all channels, and competitor prices per date.
 
 Cross-file contracts: `bar_rates.py` imports `load_raw`, `SEASONS` and `SUMMER` from `ml_demand_model.py`, which in turn reads `bar_daily.csv` / `bar_bookings.csv` (`load_bar` fails loudly if they are missing or don't cover every booking: re-run `bar_rates.py` after changing `BOOKINGS.xlsx`, the rate CSVs or the load filters). `rl_agent.py` imports `PRICE_MULTIPLIERS` from the env. The env depends on the exact `sim_data.pkl` schema produced by `build_sim_data` (per season: `capacity`, `online_avail`, `dispersion_k`, `dates`, `lambda_true`, `lambda_forecast`, `hotel_price`, `p_ref`, calendar arrays, `profiles`, `actual`; top level: `seasons`, `models`), so after changing that schema, `BOOKINGS.xlsx` or `hotel_pms_data.csv`, you must re-run `ml_demand_model.py`. `ml_demand_model.py` imports `HotelEnv` (inside `calibrate_to_availability`) to calibrate. Model keys `"rf"` / `"xgb"` are shared across the ML, env and RL files.
@@ -140,4 +223,9 @@ None of these is implemented. They are recorded as directions and as limitations
 - **Learned price response:** the ML models never see price, and the elasticity in `g(p)` is assumed. Competitor prices per date would make it possible to estimate it.
 - **Varying availability between episodes:** every episode uses the same real offline calendar, so generalisation to other group calendars is untested.
 - **Per-night censoring correction:** demand on nights closed online is unrecorded, and the recalibration uses one factor per season and model.
+- **RL train / validation / test (next step, after the full RL run on the E revised ML):** the RL equivalent of the ML protocol, with as little overfitting as possible.
+  - **Reused seasons:** the best fixed price and past design choices are selected on the same `EVAL_SEED0` seasons that are reported. Add separate validation seeds and keep `EVAL_SEED0` for the final test only.
+  - **Checkpoints:** none are selected on validation, and the learning curves include exploration.
+  - **Error bars:** the mean-of-seeds SE ignores the variance between training seeds, so 3 seeds understate uncertainty.
+  - **Testing scope:** agents are tested only in their own training world. Planned robustness tests: cross-world, other elasticities, demand ±15%.
 - **Smaller items:** length of stay that reacts to price, cancelled bookings that hold rooms until they cancel, and offline stays that arrive late instead of being fixed in advance.

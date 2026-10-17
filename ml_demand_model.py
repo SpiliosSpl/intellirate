@@ -9,9 +9,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from scipy.stats import nbinom
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import GroupKFold
-from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_poisson_deviance
 
 try:
     from xgboost import XGBRegressor
@@ -40,17 +40,40 @@ BAR_BOOKINGS_PATH = "bar_bookings.csv"  # BAR each booking was priced from
 # and room are read, to find the rooms left for online sale each night.
 PMS_PATH = "hotel_pms_data.csv"
 
-RF_PARAMS = dict(n_estimators=500, min_samples_leaf=3, max_features=0.6,
-                 random_state=42, n_jobs=-1)
-# Poisson objective: the natural loss for daily counts. Shallow trees and a
-# small learning rate: only ~390 days of data.
-XGB_PARAMS = dict(objective="count:poisson", n_estimators=400, learning_rate=0.03,
-                  max_depth=3, min_child_weight=3, subsample=0.8,
-                  colsample_bytree=0.8, random_state=42, n_jobs=-1)
+# Fixed model parameters; the rest come from WORLD_PARAMS or GRID
+RF_PARAMS = dict(n_estimators=500, random_state=42, n_jobs=-1)
+# Poisson objective: the natural loss for daily counts. Small learning rate:
+# only ~400 days of data.
+XGB_PARAMS = dict(objective="count:poisson", learning_rate=0.03, min_child_weight=3,
+                  subsample=0.8, colsample_bytree=0.8, random_state=42, n_jobs=-1)
 
 MODEL_NAMES = {"rf": "ML1 Random Forest", "xgb": "ML2 XGBoost (Poisson)"}
 
+# The world (lambda_true) describes what happened: settings that reproduce the
+# real seasons' shape and variance, fitted on every season. Not tuned on forecasts.
+WORLD_PARAMS = {"rf":  dict(min_samples_leaf=3, max_features=0.6),
+                "xgb": dict(max_depth=3, n_estimators=400)}
+
+# The forecaster (lambda_forecast, what the agent sees) is validated out of
+# time: settings chosen by GroupKFold inside TUNE_SEASON, then tested once on
+# TEST_SEASON, which never chooses anything.
+TUNE_SEASON, TEST_SEASON = 2025, 2026
+GRID = {
+    "rf":  [dict(min_samples_leaf=l, max_features=f)
+            for l in (3, 5, 10, 20, 30, 50) for f in (0.4, 0.6, 0.8, 1.0)],
+    "xgb": [dict(max_depth=d, n_estimators=n)
+            for d in (1, 2, 3) for n in (50, 100, 200, 300, 400, 600, 800, 1000)],
+}
+NATURAL_LIMITS = {"max_features": 1.0, "max_depth": 1}   # grid ends that are not edges
 N_FOLDS = 5                          # blocked by ISO week (no leakage in time)
+N_BOOT, BOOT_SEED = 2000, 0          # test CIs: resample whole ISO weeks
+MIN_TEST_DAYS = 100                  # uncensored test days required
+
+# Realism checks on the world before calibration (flagged, not fatal)
+WORLD_MIN_SPEARMAN = 0.5             # daily world vs actual requests
+WORLD_MONTH_RANGE  = (0.8, 1.25)     # monthly world / actual requests
+WORLD_VAR_TOL      = 0.01            # world vs real daily variance (fatal)
+
 MIN_PROFILES_PER_MONTH = 20          # else fall back to the whole season
 
 CALIB_SEASONS = 50                   # simulated seasons per calibration round
@@ -58,8 +81,10 @@ CALIB_SEED0   = 200_000              # never used by training or evaluation
 CALIB_TOL     = 0.005                # simulated vs real room-nights
 
 
-def make_model(name):
-    return RandomForestRegressor(**RF_PARAMS) if name == "rf" else XGBRegressor(**XGB_PARAMS)
+def make_model(name, cfg):
+    if name == "rf":
+        return RandomForestRegressor(**RF_PARAMS, **cfg)
+    return XGBRegressor(**XGB_PARAMS, **cfg)
 
 
 # =============================================================================
@@ -139,6 +164,19 @@ def online_availability(bk, pms, dates, capacity):
     return (capacity - offline).to_numpy(int)
 
 
+def add_availability(daily, bk, pms):
+    """Rooms on sale online each night, and censored nights: sold out or
+    closed online, so demand above the rooms on sale was never recorded.
+    Censored nights are kept for training but never scored."""
+    daily = daily.copy()
+    daily["online_avail"] = np.concatenate([
+        online_availability(bk, pms, daily.index[daily["season"] == s], CAPACITY[s])
+        for s in SEASONS])
+    sold = nightly_rooms(bk[bk["is_cancelled"] == 0]).reindex(daily.index, fill_value=0)
+    daily["censored"] = sold.values >= daily["online_avail"].values
+    return daily
+
+
 # =============================================================================
 # 2. DAILY TABLE + CALENDAR FEATURES
 # =============================================================================
@@ -205,67 +243,211 @@ def build_daily(bk, bar_daily):
 
 
 # =============================================================================
-# 3. ML MODELS (same blocked cross-validation for both)
+# 3. ML MODELS: forecaster validated out of time, world fitted on every season
 # =============================================================================
+
+def week_groups(index):
+    iso = index.isocalendar()
+    return (iso.year.astype(str) + "-" + iso.week.astype(str)).values
+
+
+def poisson_dev(y, p):
+    """Poisson deviance of each day."""
+    p = np.maximum(p, 1e-6)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = np.where(y > 0, y * np.log(y / p), 0.0)
+    return 2 * (t - (y - p))
+
+
+def nb_k(y, p):
+    """Negative-binomial k of the residuals around p (None: Poisson)."""
+    resid_var, mean_lam = np.var(y - p), np.mean(p)
+    return mean_lam ** 2 / (resid_var - mean_lam) if resid_var > mean_lam * 1.05 else None
+
+
+def grid_edges(name, cfg):
+    """Parameters of cfg at an end of GRID that is not a natural limit."""
+    edges = []
+    for key, v in cfg.items():
+        values = [c[key] for c in GRID[name]]
+        if v in (min(values), max(values)) and v != NATURAL_LIMITS.get(key):
+            edges.append(key)
+    return edges
+
+
+def choose_settings(name, d):
+    """Forecaster settings: GroupKFold by ISO week on TUNE_SEASON only, each
+    fold scored on its uncensored days; the best mean deviance wins.
+    Returns the chosen row ({cfg, cv, se}), its out-of-fold predictions and
+    the table of every config."""
+    if set(d["season"]) != {TUNE_SEASON}:                        # guardrail G1
+        raise RuntimeError(f"Settings must be chosen on {TUNE_SEASON} only, got {sorted(set(d['season']))}")
+    X, y, unc = d[FEATURES], d["requests"].values, ~d["censored"].values
+    folds = list(GroupKFold(n_splits=N_FOLDS).split(X, y, week_groups(d.index)))
+    rows, oofs = [], []
+    for cfg in GRID[name]:
+        oof, scores = np.zeros(len(y)), []
+        for tr, te in folds:
+            oof[te] = make_model(name, cfg).fit(X.iloc[tr], y[tr]).predict(X.iloc[te])
+            scores.append(poisson_dev(y[te][unc[te]], oof[te][unc[te]]).mean())
+        rows.append(dict(cfg=cfg, cv=np.mean(scores), se=np.std(scores, ddof=1) / np.sqrt(N_FOLDS)))
+        oofs.append(oof)
+    best = min(range(len(rows)), key=lambda i: rows[i]["cv"])
+    return rows[best], oofs[best], rows
+
+
+def test_scores(y, p, k=None):
+    """Forecast vs actual. 'level' is total forecast / total actual; the
+    pattern deviance rescales the forecast to the actual total first (the
+    agent sees the forecast divided by its maximum, i.e. only the pattern)."""
+    p = np.maximum(p, 1e-6)
+    out = {"poisson_deviance": poisson_dev(y, p).mean(),
+           "MAE": np.mean(np.abs(y - p)), "RMSE": np.sqrt(np.mean((y - p) ** 2)),
+           "level": p.sum() / y.sum(),
+           "pattern_deviance": poisson_dev(y, p * y.sum() / p.sum()).mean(),
+           "spearman": pd.Series(y).corr(pd.Series(p), method="spearman")}
+    if k is not None:                       # 80% interval from the CV dispersion
+        q = k / (k + p)
+        out["cover80"] = np.mean((y >= nbinom.ppf(0.1, k, q)) & (y <= nbinom.ppf(0.9, k, q)))
+    return out
+
+
+def deviance_gain(y, p, base, groups, rng):
+    """Baseline deviance minus model deviance (positive: model better), with a
+    95% CI from resampling whole ISO weeks."""
+    diff = poisson_dev(y, base) - poisson_dev(y, p)
+    weeks = [np.where(groups == w)[0] for w in np.unique(groups)]
+    draws = [diff[np.concatenate([weeks[i] for i in rng.integers(len(weeks), size=len(weeks))])].mean()
+             for _ in range(N_BOOT)]
+    return diff.mean(), *np.percentile(draws, [2.5, 97.5])
+
+
+def check_world(daily, name, fit):
+    """Realism of the world before calibration: rescaled to each season's real
+    total, it should follow the real days and months. Flagged, not fatal."""
+    for season in SEASONS:
+        d = daily[daily["season"] == season]
+        m = (daily["season"] == season).values
+        f = pd.Series(fit[m] * d["requests"].sum() / fit[m].sum(), index=d.index)
+        rho = d["requests"].corr(f, method="spearman")
+        month = f.groupby(d["month"]).sum() / d.groupby("month")["requests"].sum()
+        flags = []
+        if rho < WORLD_MIN_SPEARMAN:
+            flags.append(f"daily Spearman {rho:.2f} < {WORLD_MIN_SPEARMAN}")
+        out = month[(month < WORLD_MONTH_RANGE[0]) | (month > WORLD_MONTH_RANGE[1])]
+        if len(out):
+            flags.append("months outside " + str(WORLD_MONTH_RANGE) + ": "
+                         + ", ".join(f"{mo}: {v:.2f}" for mo, v in out.items()))
+        print(f"  World {name} {season}: daily Spearman {rho:.2f}, months world/actual "
+              f"{month.min():.2f}-{month.max():.2f}" + ("" if flags else "  ok"))
+        for fl in flags:
+            print(f"  !!! World {name} {season}: {fl}")
+
 
 def train_models(daily):
     X, y = daily[FEATURES], daily["requests"].values
-    iso = daily.index.isocalendar()
-    groups = (iso.year.astype(str) + "-" + iso.week.astype(str)).values
-    folds = list(GroupKFold(n_splits=N_FOLDS).split(X, y, groups))
+    tune = (daily["season"] == TUNE_SEASON).values
+    test = (daily["season"] == TEST_SEASON).values
+    if (tune & test).any() or not (tune | test).all():           # guardrail G1
+        raise RuntimeError("TUNE_SEASON and TEST_SEASON must split the daily table")
+    scored = test & ~daily["censored"].values         # test days with full demand
+    if scored.sum() < MIN_TEST_DAYS:                              # guardrail G2
+        raise RuntimeError(f"Only {scored.sum()} uncensored test days (< {MIN_TEST_DAYS})")
+    groups = week_groups(daily.index[scored])
+    rng = np.random.default_rng(BOOT_SEED)
+    # Seasonal naive baseline: the TUNE_SEASON mean of the same month
+    month_mean = daily[tune].groupby("month")["requests"].mean()
+    base = daily["month"].map(month_mean).values
 
-    # Naive baseline: season-month mean of the training folds
-    oof_base = np.zeros(len(y))
-    for tr, te in folds:
-        means = daily.iloc[tr].groupby(["season", "month"])["requests"].mean()
-        oof_base[te] = [means.get((s, mo), y[tr].mean())
-                        for s, mo in zip(daily["season"].iloc[te], daily["month"].iloc[te])]
-
-    results, rows = {}, []
+    print("=" * 72)
+    print(f"  Forecaster: settings chosen inside {TUNE_SEASON} (GroupKFold by ISO week), "
+          f"tested once on\n  {TEST_SEASON}: {scored.sum()} uncensored of {test.sum()} days "
+          f"(censored: {(daily['censored'] & tune).sum()} in {TUNE_SEASON}, "
+          f"{(daily['censored'] & test).sum()} in {TEST_SEASON})")
+    print("=" * 72)
+    results, table, grid_rows = {}, [], []
     for name in MODEL_NAMES:
-        oof = np.zeros(len(y))
-        for tr, te in folds:
-            oof[te] = make_model(name).fit(X.iloc[tr], y[tr]).predict(X.iloc[te])
-        model = make_model(name).fit(X, y)
-        fit = model.predict(X)
+        # 1. Forecaster settings: cross-validation inside TUNE_SEASON only
+        chosen, oof_tune, rows = choose_settings(name, daily[tune])
+        cfg = chosen["cfg"]
+        grid_rows += [{"model": name, **r["cfg"], "cv_deviance": r["cv"], "cv_se": r["se"],
+                       "chosen": r is chosen} for r in rows]
+        unc = ~daily["censored"].values[tune]
+        k = nb_k(y[tune][unc], oof_tune[unc])        # forecast error (reported)
+        edges = grid_edges(name, cfg)
+        print(f"  {MODEL_NAMES[name]:24s} {cfg}  CV dev {chosen['cv']:.3f} ± {chosen['se']:.3f}")
+        if edges:
+            print(f"  !!! {MODEL_NAMES[name]}: chosen {', '.join(edges)} at the edge of GRID")
 
-        # Day-to-day variability around this model's forecast (reported)
-        resid_var, mean_lam = np.var(y - oof), np.mean(oof)
-        k = mean_lam ** 2 / (resid_var - mean_lam) if resid_var > mean_lam * 1.05 else None
+        # 2. Test: refit on TUNE_SEASON, scored once on TEST_SEASON
+        forecaster = make_model(name, cfg).fit(X[tune], y[tune])
+        pred_test = forecaster.predict(X[test])
+        p = pred_test[scored[test]]
+        gain, lo, hi = deviance_gain(y[scored], p, base[scored], groups, rng)
+        table.append({"evaluation": f"test_{TEST_SEASON}", "model": MODEL_NAMES[name],
+                      "config": str(cfg), "cv_deviance": chosen["cv"], "cv_se": chosen["se"],
+                      **test_scores(y[scored], p, k),
+                      "gain_vs_baseline": gain, "gain_lo": lo, "gain_hi": hi, "dispersion_k": k})
+
+        # The agent's forecast is never in-sample: TUNE_SEASON out-of-fold,
+        # TEST_SEASON from the model trained on TUNE_SEASON
+        oof = np.full(len(y), np.nan)
+        oof[tune], oof[test] = oof_tune, pred_test
+        if np.isnan(oof).any():                                   # guardrail G1
+            raise RuntimeError("Some days have no out-of-sample forecast")
+
+        # Reference only: the pooled cross-validation over both seasons that was
+        # used before. Neighbouring TEST_SEASON weeks are in training: optimistic.
+        pooled = np.zeros(len(y))
+        for tr, te in GroupKFold(n_splits=N_FOLDS).split(X, y, week_groups(daily.index)):
+            pooled[te] = make_model(name, WORLD_PARAMS[name]).fit(X.iloc[tr], y[tr]).predict(X.iloc[te])
+        table.append({"evaluation": "pooled_cv_reference", "model": MODEL_NAMES[name],
+                      "config": str(WORLD_PARAMS[name]), **test_scores(y[scored], pooled[scored]),
+                      **dict(zip(("gain_vs_baseline", "gain_lo", "gain_hi"),
+                                 deviance_gain(y[scored], pooled[scored], base[scored], groups, rng)))})
+
+        # 3. World: a description of the real seasons, fitted on all of them
+        model = make_model(name, WORLD_PARAMS[name]).fit(X, y)
+        fit = model.predict(X)
         # Shocks for the simulated world: the world's pattern is the in-sample
         # fit, which already holds part of the data's luck. Choose k so that the
-        # world's total variance equals the real one:
+        # world's total variance equals the real one, on the fit after the
+        # per-season rescale that build_sim_data applies:
         # Var(y) = E[fit] + Var(fit) + E[fit^2] / k
         k_world = {}
         for season in SEASONS:                      # one k per season
             m = (daily["season"] == season).values
-            extra = np.var(y[m]) - np.mean(fit[m]) - np.var(fit[m])
-            k_world[season] = (np.mean(fit[m] ** 2) / extra
-                               if extra > 0.05 * np.mean(fit[m]) else None)
+            f = fit[m] * y[m].sum() / fit[m].sum()
+            extra = np.var(y[m]) - np.mean(f) - np.var(f)
+            k_world[season] = np.mean(f ** 2) / extra if extra > 0.05 * np.mean(f) else None
 
         imp = pd.Series(model.feature_importances_, index=FEATURES)
-        results[name] = dict(model=model, fit=fit, oof=oof, k=k, k_world=k_world, importance=imp)
-        rows.append((MODEL_NAMES[name], oof, k))
+        results[name] = dict(model=model, forecaster=forecaster, config=cfg, fit=fit, oof=oof,
+                             k=k, k_world=k_world, importance=imp)
+    table.append({"evaluation": "baseline", "model": f"Baseline: {TUNE_SEASON} month mean",
+                  **test_scores(y[scored], base[scored])})
 
-    rows.append(("Baseline: season-month mean", oof_base, None))
-
-    print("=" * 72)
-    print("  ML comparison — out-of-fold (blocked by week) vs ACTUAL daily requests")
-    print("=" * 72)
-    print(f"  {'':30s}{'MAE':>8}{'RMSE':>8}{'Poisson dev.':>14}{'NB k':>8}")
-    table = []
-    for label, p, k in rows:
-        mae = mean_absolute_error(y, p)
-        rmse = mean_squared_error(y, p) ** 0.5
-        dev = mean_poisson_deviance(y, np.maximum(p, 1e-6))
-        print(f"  {label:30s}{mae:8.3f}{rmse:8.3f}{dev:14.3f}"
-              f"{(f'{k:8.2f}' if k else '       -')}")
-        table.append({"model": label, "MAE": mae, "RMSE": rmse,
-                      "poisson_deviance": dev, "dispersion_k": k})
+    print(f"\n  Test on {TEST_SEASON} (uncensored days); gain = baseline deviance - model deviance")
+    print(f"  {'':46s}{'Dev.':>7}{'MAE':>7}{'Level':>7}{'Pattern':>9}{'Spearman':>10}"
+          f"{'Cover80':>9}   Gain [95% CI]")
+    for r in table:
+        label = r["model"] + (" (pooled CV, optimistic)" if r["evaluation"] == "pooled_cv_reference" else "")
+        cover = f"{r['cover80']:9.2f}" if "cover80" in r else " " * 9
+        gain = (f"   {r['gain_vs_baseline']:+.3f} [{r['gain_lo']:+.3f}, {r['gain_hi']:+.3f}]"
+                if "gain_vs_baseline" in r else "")
+        print(f"  {label:46s}{r['poisson_deviance']:7.3f}{r['MAE']:7.3f}{r['level']:7.2f}"
+              f"{r['pattern_deviance']:9.3f}{r['spearman']:10.3f}{cover}{gain}")
+        if r["evaluation"] == f"test_{TEST_SEASON}" and r["gain_hi"] < 0:
+            print(f"  !!! {r['model']}: significantly worse than the baseline out of time")
+    print("  The pooled rows train on neighbouring test weeks: report them only as the optimistic bound.")
     pd.DataFrame(table).to_csv("ml_comparison.csv", index=False)
+    pd.DataFrame(grid_rows).to_csv("ml_cv_grid.csv", index=False)
+    print()
+    for name, r in results.items():
+        check_world(daily, name, r["fit"])
     print()
     imp = pd.DataFrame({MODEL_NAMES[n]: r["importance"] for n, r in results.items()})
-    print("  Feature importance:")
+    print("  Feature importance (world models):")
     print(imp.sort_values(MODEL_NAMES["rf"], ascending=False)
              .to_string(float_format=lambda v: f"{v:.3f}"))
     print()
@@ -276,7 +458,7 @@ def train_models(daily):
 # 4. SIMULATION DATA
 # =============================================================================
 
-def build_sim_data(bk, daily, results, pms):
+def build_sim_data(bk, daily, results):
     daily = daily.copy()
     for name, r in results.items():
         daily[f"true_{name}"] = np.maximum(r["fit"], 0.01)
@@ -286,6 +468,16 @@ def build_sim_data(bk, daily, results, pms):
             mask = daily["season"] == season
             daily.loc[mask, f"true_{name}"] *= (daily.loc[mask, "requests"].sum()
                                                 / daily.loc[mask, f"true_{name}"].sum())
+            # Guardrail G3: the world's daily variance (fit + Poisson + gamma
+            # shocks) must equal the real one for the rescaled fit it will drive
+            f, y = daily.loc[mask, f"true_{name}"].values, daily.loc[mask, "requests"].values
+            k = r["k_world"][season]
+            ratio = (f.mean() + f.var() + ((f ** 2).mean() / k if k else 0)) / y.var()
+            if k and abs(ratio - 1) > WORLD_VAR_TOL:
+                raise RuntimeError(f"World {name} {season}: variance {ratio:.3f} x real")
+            if not k:
+                print(f"  World {name} {season}: Poisson only (the fit carries the real variance), "
+                      f"variance {ratio:.2f} x real")
 
     seasons = {}
     for season in SEASONS:
@@ -305,7 +497,7 @@ def build_sim_data(bk, daily, results, pms):
         ok = s[s["is_cancelled"] == 0]
         seasons[season] = {
             "capacity":        CAPACITY[season],
-            "online_avail":    online_availability(bk, pms, d.index, CAPACITY[season]),
+            "online_avail":    d["online_avail"].to_numpy(int),
             "dispersion_k":    {n: r["k_world"][season] for n, r in results.items()},
             "dates":           d.index,
             "lambda_true":     {n: d[f"true_{n}"].values for n in results},
@@ -332,7 +524,8 @@ def calibrate_to_availability(sim):
     room-nights. Demand on nights closed online was never recorded, so the
     season-total scaling alone under-books. At the hotel's price the price
     response cancels, so the factor does not depend on the elasticity.
-    Returns {(season, model): (factor, simulated / real - 1)}."""
+    Returns {(season, model): (factor, simulated / real - 1)}. Fails if the
+    simulator cannot be brought within CALIB_TOL (guardrail G4)."""
     from hotel_season_env import HotelEnv      # the env reads sim_data: import here
     out = {}
     for season, s in sim["seasons"].items():
@@ -350,6 +543,9 @@ def calibrate_to_availability(sim):
                     break
                 s["lambda_true"][name] = s["lambda_true"][name] * ratio
                 factor *= ratio
+            else:
+                raise RuntimeError(f"Calibration of {name} {season} did not converge "
+                                   f"(simulated / real room-nights {1 / ratio:.3f})")
             out[season, name] = (factor, 1 / ratio - 1)
     return out
 
@@ -368,7 +564,8 @@ def plot_fit(daily, results, path="demand_fit.png"):
             ax.plot(fit.index, fit, color=colours[n], lw=2,
                     label=f"{MODEL_NAMES[n]} fit (simulator)")
             ax.plot(oof.index, oof, "--", color=colours[n], lw=1.2, alpha=0.8,
-                    label=f"{MODEL_NAMES[n]} out-of-fold (forecast)")
+                    label=f"{MODEL_NAMES[n]} forecast ({TUNE_SEASON} out-of-fold, "
+                          f"{TEST_SEASON} trained on {TUNE_SEASON})")
         ax.set_title(f"Weekly booking requests — STD, season {season}")
         ax.grid(alpha=0.3)
         ax.legend(fontsize=9)
@@ -390,7 +587,7 @@ if __name__ == "__main__":
           f"(export date {export_date.date()}; later stay dates excluded)")
     print("=" * 66 + "\n")
 
-    daily = build_daily(bk, bar_daily)
+    daily = add_availability(build_daily(bk, bar_daily), bk, pms)
     for season in SEASONS:
         d = daily[daily["season"] == season]
         print(f"  Season {season}: {d.index.min().date()} -> {d.index.max().date()}  "
@@ -399,7 +596,7 @@ if __name__ == "__main__":
     print()
 
     results = train_models(daily)
-    sim = build_sim_data(bk, daily, results, pms)
+    sim = build_sim_data(bk, daily, results)
     calib = calibrate_to_availability(sim)
     print("  Online availability: capacity - (PMS rooms - confirmed online rooms)")
     for season, s in sim["seasons"].items():
@@ -416,9 +613,12 @@ if __name__ == "__main__":
                   f"(hotel prices: {err:+.1%} room-nights)")
     print()
 
-    joblib.dump({"models": {n: r["model"] for n, r in results.items()},
+    joblib.dump({"world": {n: r["model"] for n, r in results.items()},
+                 "forecast": {n: r["forecaster"] for n, r in results.items()},
+                 "configs": {n: {"world": WORLD_PARAMS[n], "forecast": r["config"]}
+                             for n, r in results.items()},
                  "features": FEATURES}, "demand_models.pkl")
     joblib.dump(sim, "sim_data.pkl")
     plot_fit(daily, results)
-    print("  Saved: demand_models.pkl, sim_data.pkl, ml_comparison.csv")
+    print("  Saved: demand_models.pkl, sim_data.pkl, ml_comparison.csv, ml_cv_grid.csv")
     print("\n  Next: python rl_agent.py")

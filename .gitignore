@@ -11,6 +11,7 @@ bar_validation.txt
 bar_daily.png
 *.pkl
 ml_comparison.csv
+ml_cv_grid.csv
 demand_fit.png
 results_*/
 comparison_*.csv
