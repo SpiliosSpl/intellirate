@@ -26,7 +26,7 @@ python rl_agent.py             # sim_data.pkl -> results_<season>_<model>_e<elas
 Useful `rl_agent.py` flags for quick or partial runs:
 - `--models rf` (or `xgb`) runs only one pipeline.
 - `--algos ppo` (or `ddqn`) trains only one RL algorithm (default: all keys in `ALGOS`).
-- `--timesteps 20000 --seeds 42 --no-sensitivity` gives a fast smoke run (the default is 500k steps × 3 seeds for each algorithm, plus a sensitivity sweep). Note that a smoke run overwrites the `results_*` / `comparison_*` outputs of a full run with the same season, elasticity and world.
+- `--timesteps 20000 --eval-every 5000 --seeds 42 --no-sensitivity` gives a fast smoke run (the default is 300k steps × 3 seeds for each algorithm, validated every 25k steps, plus a sensitivity sweep). Note that a smoke run overwrites the `results_*` / `comparison_*` outputs of a full run with the same season, elasticity and world.
 - `--season 2025` and `--elasticity 1.2` change the scenario.
 - `--common-world rf` makes every pipeline use the same "true" demand model while each agent keeps its own forecast. The output directories and tags get a `_world-<m>` suffix.
 - `--jobs 3` (the default) trains the seeds of each ML × RL combination in parallel processes, each with one torch thread. Parallelism is per seed, so at most `len(--seeds)` processes run. `--jobs 1` runs sequentially and gives identical results. A GPU doesn't help here: the networks are tiny and the bottleneck is Python overhead per step. Running all ML × RL × seed jobs in one pool (more seeds on more cores) is planned.
@@ -80,17 +80,33 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    - The observation has 9 dims in [-1, 1]: forecast, committed rooms today and tomorrow (offline stays included), cyclic month and day of week, holiday flag, and season progress.
    - `HotelEnv(..., sim=dict)` takes the sim data directly; the calibration uses this.
    - Baselines use `step_price(price)` to pass an arbitrary price, for example the hotel's BAR.
+   - **The env is the project's MDP** (the code never names it). The state is the day `t` plus the `committed` calendar, the action is the multiplier, the reward is revenue minus variable cost, the horizon is finite (one season) and γ = 0.99 is set in `rl_agent.py`. Strictly it is a POMDP: the observation shows committed rooms only for tonight and tomorrow, so longer stays are partly hidden. With a mean stay of 1.26 nights, today's price barely affects later states, so the problem is close to a contextual bandit.
 
 3. **[rl_agent.py](rl_agent.py)** runs one pipeline per ML model, and each pipeline trains every RL algorithm:
    - RL algorithms live in the `ALGOS` registry (`key -> (SB3 class, params, display name)`). `train_agent` is generic: SB3, CPU, `VecNormalize` on reward only, which is also valid for Double DQN because off-policy SB3 normalises replay-buffer rewards at sample time. To add an algorithm, add a registry entry.
    - Double DQN (`"ddqn"`, which replaced DQN) is `DoubleDQN(DQN)`. SB3 has no Double DQN, so it overrides `train()`, copied from SB3 2.8.0's `DQN.train` (re-check it after an SB3 upgrade). Only the next-state value changes (`next_q_values`): the online net selects the action and the target net evaluates it. `DQN_PARAMS` is unchanged from the DQN it replaced, so the TD target is the only difference. The Experiment findings section has the comparison with DQN.
    - It validates the simulator: the hotel's prices in the sim are compared with the real season. Occupancy and RevPAR in `results.csv` are over the online available room-nights.
-   - It finds the best fixed price once per ML model, then trains each algorithm for each seed.
-   - It evaluates every policy on the same `N_EVAL` seasons, seeded from `EVAL_SEED0 = 100000` so they are never seen in training.
+   - **Train / validation / test (protocol `val-test`).** All three are simulated seasons of the same world, told apart by seed:
+     - **Training:** each training seed's own SB3 stream (about 1,500 seasons at 300k steps).
+     - **Validation:** seeds from `VAL_SEED0 = 100000`, the old evaluation seasons, which past design choices already used. It chooses things and is never reported as a result:
+       - `ValidationCheckpoint` runs the greedy policy on the first `N_VAL = 50` seasons every `--eval-every` steps (default `EVAL_EVERY = 25_000`) and at the end of training. It saves the best checkpoint as `<algo>_seed<n>.zip`, and that checkpoint is the one tested, not the final one.
+       - The best fixed price is chosen on `N_VAL_FIXED = 200` validation seasons (no training, so more seasons are cheap; 50 sometimes missed a near-tie).
+     - **Test:** `N_TEST = 200` seasons from `TEST_SEED0 = 500000`, shared by every policy (common random numbers). Every reported number comes from them, including the simulator check. Never choose anything on them: design choices use validation only, and the test is looked at once.
+     - The callback has its own env, and a deterministic `predict` draws no random numbers, so training is identical to a run without it (checked: identical `monitor.csv` for all 12 agents).
+   - It finds the best fixed price once per ML model, then trains each algorithm for each seed. **The best fixed price stays for now;** later it will either get a switch to turn it on or off, or be removed entirely.
    - It reports the gain over the hotel split into a price-*level* effect (best fixed vs hotel, driven by the elasticity assumption) and a *day-by-day* effect per algorithm (RL vs best fixed). A negative day-by-day number means the agent hasn't converged.
-   - It also sweeps elasticity for the best fixed price, with no training.
-   - Per ML model it writes `results_*/` containing `results.csv`, `summary.txt`, `learning_curve_<algo>.png`, `price_path.png` and `<algo>_seed<n>.zip`. `comparison_<tag>.csv/.png` gets one row per ML × RL combination, with `rl_*` columns.
-   - Every run appends one row per ML model to `elasticity_log_<model>.csv` (`append_elasticity_log`). Each row has the timestamp, season, elasticity, timesteps and seeds, the hotel revenue, the best fixed multiplier and its revenue, plus each algorithm's mean-of-seeds revenue and occupancy, all taken from `results.csv`. It tracks results across runs at different `--elasticity` values. A rerun adds a row instead of replacing one, and a skipped algorithm leaves its columns empty. If the log's columns no longer match `ALGOS`, the run fails instead of appending. Runs in the repo append to it too, which is another reason to keep smoke runs in a scratch copy.
+   - **Error bars:** each seed row has the paired SE over the test seasons. The mean-of-seeds rows and the `comparison` columns `rl_vs_hotel_se_%` / `rl_vs_best_fixed_se_%` combine the variance between training seeds with the season noise (`seed_se`: `sqrt(Var_seeds/n + season_se²)`). The `*_ci95_%` columns use t(n−1), so 3 seeds give wide CIs (t = 4.30). Report the mean of all seeds, never the best one. More seeds need no code change (`--seeds 42 7 123 1 2024 --jobs 5` on a machine with enough cores).
+   - It also sweeps elasticity for the best fixed price, with no training: chosen on validation, reported against the hotel on the first `SENSITIVITY_N_EVAL = 100` test seasons.
+   - Per ML model it writes `results_*/` containing:
+     - `results.csv` (test numbers; seed rows add `checkpoint_step`, `val_reward`, `val_vs_hotel_%`);
+     - `validation_curve.csv`;
+     - `summary.txt`;
+     - `learning_curve_<algo>.png` (top: training episodes, exploration included; bottom: greedy validation curve, with the selected checkpoint starred);
+     - `price_path.png`;
+     - `<algo>_seed<n>.zip` (the selected checkpoint).
+
+     `comparison_<tag>.csv/.png` gets one row per ML × RL combination, with `rl_*` columns.
+   - Every run appends one row per ML model to `elasticity_log_<model>.csv` (`append_elasticity_log`). Each row has the timestamp, the `protocol` (`val-test`; logs from before the change lack the column and must be renamed before the next run), season, elasticity, timesteps and seeds, the hotel revenue, the best fixed multiplier and its revenue, plus each algorithm's mean-of-seeds revenue and occupancy, all taken from `results.csv`. It tracks results across runs at different `--elasticity` values. A rerun adds a row instead of replacing one, and a skipped algorithm leaves its columns empty. If the log's columns no longer match `ALGOS`, the run fails instead of appending. Runs in the repo append to it too, which is another reason to keep smoke runs in a scratch copy.
 
 ## Booking data and rates
 
@@ -207,6 +223,24 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
     - seed and checkpoint selection on the reported seasons;
     - the best fixed price chosen on the same seasons it is reported on;
     - error bars that ignore the variance between training seeds.
+
+    All three are fixed by the `val-test` protocol (next item).
+- **RL train / validation / test protocol (smoke runs in scratch, 17 Oct 2026; 100k × seeds 42 / 7 / 123, both ML models and both algorithms; old code vs the `val-test` protocol, which is applied):**
+  - **The old code didn't overfit its evaluation seasons.** I re-tested its agents on 200 fresh seasons: the gain was the same as on the reported seasons (mean difference 0.00 rf / 0.04 xgb points; each agent within ±0.15). Every training episode is a fresh draw, and nothing was chosen on the agents.
+  - **Its best fixed price was about 0.1 points optimistic** (+1.62 / +1.73% reported, +1.51 / +1.63% on fresh seasons). That is mostly noise between the season sets; the best level on fresh seasons was the same (rf) or a near-tie (xgb 1.20× vs 1.15×).
+  - **The final checkpoint was the real problem.** The checkpoint chosen on validation beat the final one on fresh seasons by +0.72 (rf) / +0.82 (xgb) points on average, and by up to +2.4 for one Double DQN seed. The reported SE (≈ 0.1) also hid seed differences of up to 3 points.
+  - **The new protocol's checkpoint selection isn't optimistic:** validation − test is −0.09 (rf) / −0.04 (xgb) on average, and each agent is within ±0.3.
+  - **Test results** (vs hotel, 95% CI including seed variance):
+
+    | | rf | xgb |
+    |---|---|---|
+    | PPO | +1.16 ± 0.47% | +1.56 ± 0.51% |
+    | Double DQN | +0.42 ± 0.85% | +0.45 ± 0.71% |
+    | Best fixed | +1.51% | +1.63% |
+
+    PPO vs best fixed: −0.35 ± 0.33 (rf) / −0.07 ± 0.31 (xgb). There is still no day-by-day gain.
+  - These are 100k-step numbers; the full 300k run will replace them.
+  - **The checks don't cover overfitting to the simulator itself** (same world, offline calendar and ε in training and test). That is what the robustness tests in future work are for.
 - **PMS data as demand training data (scratch test, not applied): no.**
   - Group stays move against online requests (weekly correlation −0.4 to −0.6, also on uncensored nights), and total PMS occupancy carries almost no signal (≈ +0.1).
   - As a prior-year pattern for 2026, every PMS index is significantly worse than the 2025 online month mean. Older PMS-only seasons (2023–24, no online channel) would therefore not help the demand model.
@@ -223,9 +257,13 @@ None of these is implemented. They are recorded as directions and as limitations
 - **Learned price response:** the ML models never see price, and the elasticity in `g(p)` is assumed. Competitor prices per date would make it possible to estimate it.
 - **Varying availability between episodes:** every episode uses the same real offline calendar, so generalisation to other group calendars is untested.
 - **Per-night censoring correction:** demand on nights closed online is unrecorded, and the recalibration uses one factor per season and model.
-- **RL train / validation / test (next step, after the full RL run on the E revised ML):** the RL equivalent of the ML protocol, with as little overfitting as possible.
-  - **Reused seasons:** the best fixed price and past design choices are selected on the same `EVAL_SEED0` seasons that are reported. Add separate validation seeds and keep `EVAL_SEED0` for the final test only.
-  - **Checkpoints:** none are selected on validation, and the learning curves include exploration.
-  - **Error bars:** the mean-of-seeds SE ignores the variance between training seeds, so 3 seeds understate uncertainty.
-  - **Testing scope:** agents are tested only in their own training world. Planned robustness tests: cross-world, other elasticities, demand ±15%.
+- **RL robustness tests (next RL step; the `val-test` protocol, its first part, is done):** agents are tested only in their own training world, so overfitting to the simulator goes undetected.
+  - **Plan:** a `--robustness` flag, off by default and evaluation only. It tests each selected checkpoint, the hotel and the best fixed price (chosen under the training assumptions) on the test seasons in:
+    - the other ML world (the agent keeps its own forecast);
+    - ε 0.8 / 1.2;
+    - demand ×0.85 / ×1.15 (a new `demand_scale` parameter in `HotelEnv`, default 1, keeping common random numbers).
+  - If the agents prove fragile, the next step is training across worlds (domain randomisation).
+- **RL hyperparameter tuning:** `PPO_PARAMS` / `DQN_PARAMS` are set by hand; nothing tunes them. If tuned, it must be a small grid scored on the validation seasons only.
+- **Best fixed price:** kept for now; it will later either get a switch to turn it on or off, or be removed.
+- **More seeds:** 5 seeds × 5 jobs once a machine with more cores is available (no code change).
 - **Smaller items:** length of stay that reacts to price, cancelled bookings that hold rooms until they cancel, and offline stays that arrive late instead of being fixed in advance.

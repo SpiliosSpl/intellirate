@@ -7,11 +7,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import pandas as pd
+from scipy import stats
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from stable_baselines3 import PPO, DQN
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.results_plotter import load_results, ts2xy
@@ -27,11 +29,20 @@ SEASON      = 2026
 MODELS      = ["rf", "xgb"]
 MODEL_NAMES = {"rf": "ML1 RF", "xgb": "ML2 XGB"}
 ELASTICITY  = 1.0
-TIMESTEPS   = 500_000              # per algorithm and seed
+TIMESTEPS   = 300_000              # per algorithm and seed
 SEEDS       = [42, 7, 123]
 JOBS        = 3                    # parallel processes: the seeds of one ML x RL train together
-N_EVAL      = 200                  # simulated seasons per policy
-EVAL_SEED0  = 100_000              # evaluation seasons: never seen in training
+
+# Simulated seasons by role, told apart by their seed. Training uses each training
+# seed's own SB3 stream. Validation chooses (checkpoints, best fixed price); test is
+# only reported, never used to choose anything, and looked at once.
+VAL_SEED0   = 100_000              # the old evaluation seasons: past design choices used them
+N_VAL       = 50                   # checkpoints: the first N_VAL validation seasons
+N_VAL_FIXED = 200                  # best fixed price: no training, so cheap -> more seasons
+TEST_SEED0  = 500_000
+N_TEST      = 200
+EVAL_EVERY  = 25_000               # training steps between validations of the greedy policy
+assert VAL_SEED0 + max(N_VAL, N_VAL_FIXED) <= TEST_SEED0, "validation and test seasons overlap"
 
 PPO_PARAMS = dict(learning_rate=3e-4, n_steps=2048, batch_size=256,
                   n_epochs=10, gamma=0.99, ent_coef=0.01)
@@ -92,17 +103,18 @@ ALGOS = {
 RL_COLOURS = ["#2E75B6", "#8E44AD", "#16A085", "#7F8C8D"]   # by position in --algos
 
 SENSITIVITY_ELASTICITIES = [0.6, 0.8, 1.0, 1.2, 1.5]
-SENSITIVITY_N_EVAL       = 100     # seasons per policy (same for hotel and fixed)
+SENSITIVITY_N_EVAL       = 100     # test seasons per policy (same for hotel and fixed)
 
 ELASTICITY_LOG = "elasticity_log_{model}.csv"   # one row appended per run
+PROTOCOL       = "val-test"                     # logged: rows of older runs used one season set
 
 
 # =============================================================================
 # POLICY EVALUATION
 # =============================================================================
 
-def run_policy(env, act, n=N_EVAL, seed0=EVAL_SEED0, record_path=False):
-    """act(env, obs) -> result of env.step / env.step_price."""
+def run_policy(env, act, n=N_TEST, seed0=TEST_SEED0, record_path=False):
+    """act(env, obs) -> result of env.step / env.step_price. Default: the test seasons."""
     rows, path = [], None
     for i in range(n):
         obs, _ = env.reset(seed=seed0 + i)
@@ -138,11 +150,13 @@ def agent_policy(model):
 def summarise(name, df, base, env):
     diff = df["reward"].values - base["reward"].values          # paired
     avail = env.online_avail.sum()                              # online room-nights for sale
+    se = 100 * diff.std(ddof=1) / np.sqrt(len(diff)) / base["reward"].mean()
     return {
         "policy": name,
         "revenue": df["revenue"].mean(),
         "vs_hotel_%": 100 * diff.mean() / base["reward"].mean(),
-        "vs_hotel_se_%": 100 * diff.std(ddof=1) / np.sqrt(len(diff)) / base["reward"].mean(),
+        "vs_hotel_se_%": se,
+        "vs_hotel_ci95_%": stats.norm.ppf(0.975) * se,
         "room_nights": df["room_nights"].mean(),
         "occupancy_%": 100 * df["room_nights"].mean() / avail,
         "ADR": df["revenue"].mean() / df["room_nights"].mean(),
@@ -151,13 +165,27 @@ def summarise(name, df, base, env):
     }
 
 
-def find_best_fixed(env, n=N_EVAL):
-    """Best constant price level: (its action, mean reward of every level,
-    its evaluation seasons)."""
-    runs = [run_policy(env, fixed_policy(a), n=n)[0] for a in range(len(PRICE_MULTIPLIERS))]
-    means = [df["reward"].mean() for df in runs]
-    best = int(np.argmax(means))
-    return best, means, runs[best]
+def seed_se(dfs, base):
+    """SE and 95% CI half-width (% of base) of the mean-of-seeds gain over base:
+    the variance between training seeds plus the season noise of the
+    seed-averaged run. With one seed: season noise only, CI nan."""
+    n, ref = len(dfs), base["reward"].mean()
+    diff = pd.concat(dfs).groupby(level=0).mean()["reward"].values - base["reward"].values
+    season = 100 * diff.std(ddof=1) / np.sqrt(len(diff)) / ref
+    if n < 2:
+        return season, np.nan
+    gains = [100 * (df["reward"].values - base["reward"].values).mean() / ref for df in dfs]
+    se = np.sqrt(np.var(gains, ddof=1) / n + season ** 2)
+    return se, stats.t.ppf(0.975, n - 1) * se
+
+
+def find_best_fixed(env, n=N_VAL_FIXED, seed0=VAL_SEED0):
+    """Best constant price level, chosen on the validation seasons:
+    (its action, its run on those seasons)."""
+    runs = [run_policy(env, fixed_policy(a), n=n, seed0=seed0)[0]
+            for a in range(len(PRICE_MULTIPLIERS))]
+    best = int(np.argmax([df["reward"].mean() for df in runs]))
+    return best, runs[best]
 
 
 def append_elasticity_log(model_name, args, table, suffix, best_multiplier):
@@ -165,6 +193,7 @@ def append_elasticity_log(model_name, args, table, suffix, best_multiplier):
     and occupancy to the model's log, to track how they change with the
     elasticity across runs."""
     row = {"timestamp": datetime.now().isoformat(timespec="seconds"),
+           "protocol": PROTOCOL,
            "season": args.season, "elasticity": args.elasticity,
            "timesteps": args.timesteps, "seeds": " ".join(map(str, args.seeds)),
            "hotel_revenue": table["revenue"].iloc[0],           # rows 0-1: hotel, best fixed
@@ -185,7 +214,38 @@ def append_elasticity_log(model_name, args, table, suffix, best_multiplier):
     print(f"Appended to {path}")
 
 
-def train_agent(algo, seed, log_dir, env_kwargs, timesteps):
+class ValidationCheckpoint(BaseCallback):
+    """Greedy policy on the validation seasons every `every` steps and at the end
+    of training; saves the best model to save_path. It has its own env with
+    seeded resets, and a deterministic predict draws no random numbers, so the
+    training run is the same as without it."""
+
+    def __init__(self, env_kwargs, save_path, every):
+        super().__init__()
+        self.val_env = HotelEnv(**env_kwargs)
+        self.save_path, self.every = save_path, every
+        self.curve, self.best, self.best_step = [], -np.inf, None
+
+    def _validate(self):
+        df, _ = run_policy(self.val_env, agent_policy(self.model), n=N_VAL, seed0=VAL_SEED0)
+        score = df["reward"].mean()
+        self.curve.append((self.num_timesteps, score))
+        if score > self.best:                       # ties keep the earlier checkpoint
+            self.best, self.best_step = score, self.num_timesteps
+            self.model.save(self.save_path)
+
+    def _on_step(self):
+        if self.num_timesteps % self.every == 0:    # one env: one step per call
+            self._validate()
+        return True
+
+    def _on_training_end(self):
+        if not self.curve or self.curve[-1][0] != self.num_timesteps:
+            self._validate()
+
+
+def train_agent(algo, seed, log_dir, save_path, env_kwargs, timesteps, eval_every):
+    """Train, then reload the checkpoint with the best validation score."""
     cls, params, _ = ALGOS[algo]
     os.makedirs(log_dir, exist_ok=True)
     # Reward normalisation: off-policy agents store raw rewards in the replay
@@ -193,38 +253,48 @@ def train_agent(algo, seed, log_dir, env_kwargs, timesteps):
     venv = VecNormalize(DummyVecEnv([lambda: Monitor(HotelEnv(**env_kwargs), log_dir)]),
                         norm_obs=False, norm_reward=True, gamma=params["gamma"])
     model = cls("MlpPolicy", venv, seed=seed, verbose=0, device="cpu", **params)
-    model.learn(total_timesteps=timesteps)
-    return model
+    val = ValidationCheckpoint(env_kwargs, save_path, eval_every)
+    model.learn(total_timesteps=timesteps, callback=val)
+    return cls.load(save_path, device="cpu"), val
 
 
-def train_and_evaluate(algo, seed, log_dir, save_path, env_kwargs, timesteps):
-    """One seed: train, save, evaluate. Top-level so that worker processes
-    (spawned on Windows) can import it. One torch thread per process: the
-    network is too small to gain from more, and it measured faster."""
+def train_and_evaluate(algo, seed, log_dir, save_path, env_kwargs, timesteps, eval_every):
+    """One seed: train, keep the best validation checkpoint, test it. Top-level
+    so that worker processes (spawned on Windows) can import it. One torch
+    thread per process: the network is too small to gain from more, and it
+    measured faster."""
     torch.set_num_threads(1)
-    model = train_agent(algo, seed, log_dir, env_kwargs, timesteps)
-    model.save(save_path)
-    return run_policy(HotelEnv(**env_kwargs), agent_policy(model), record_path=True)
+    model, val = train_agent(algo, seed, log_dir, save_path, env_kwargs, timesteps, eval_every)
+    df, path = run_policy(HotelEnv(**env_kwargs), agent_policy(model), record_path=True)
+    return df, path, val.curve, val.best_step
 
 
 # =============================================================================
 # PLOTS
 # =============================================================================
 
-def plot_learning(log_dirs, seeds, algo_name, hotel_mean, fixed_mean, path, title):
-    fig, ax = plt.subplots(figsize=(10, 5))
-    for d, sd in zip(log_dirs, seeds):
+def plot_learning(log_dirs, curves, seeds, algo_name, hotel_val, fixed_val, path, title):
+    """Top: training episodes (exploration included). Bottom: greedy policy on the
+    validation seasons, with the selected checkpoint starred."""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    for d, curve, sd in zip(log_dirs, curves, seeds):
         x, y = ts2xy(load_results(d), "timesteps")
         w = max(1, len(y) // 30)
-        ax.plot(x[w - 1:], np.convolve(y, np.ones(w) / w, mode="valid"), lw=1.8,
-                label=f"{algo_name} seed {sd}")
-    ax.axhline(hotel_mean, color="#C0392B", ls="--", lw=1.5, label="Hotel (actual prices)")
-    ax.axhline(fixed_mean, color="#E67E22", ls=":", lw=1.8, label="Best fixed price")
-    ax.set_xlabel("Training timesteps (days simulated)")
-    ax.set_ylabel("Season revenue (EUR)")
-    ax.set_title(title)
-    ax.grid(alpha=0.3)
-    ax.legend()
+        ax1.plot(x[w - 1:], np.convolve(y, np.ones(w) / w, mode="valid"), lw=1.8,
+                 label=f"{algo_name} seed {sd}")
+        steps, scores = zip(*curve)
+        line, = ax2.plot(steps, scores, marker="o", ms=3, lw=1.5, label=f"{algo_name} seed {sd}")
+        i = int(np.argmax(scores))
+        ax2.plot(steps[i], scores[i], marker="*", ms=14, color=line.get_color())
+    for ax in (ax1, ax2):
+        ax.axhline(hotel_val, color="#C0392B", ls="--", lw=1.5, label="Hotel (actual prices)")
+        ax.axhline(fixed_val, color="#E67E22", ls=":", lw=1.8, label="Best fixed price")
+        ax.set_ylabel("Season revenue (EUR)")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+    ax1.set_title(f"{title}\ntraining episodes (exploration included)")
+    ax2.set_title(f"greedy policy on {N_VAL} validation seasons (star: selected checkpoint)")
+    ax2.set_xlabel("Training timesteps (days simulated)")
     plt.tight_layout(); plt.savefig(path, dpi=150); plt.close()
 
 
@@ -267,7 +337,7 @@ def plot_comparison(comp, path, title):
                color=colour, capsize=4, label=f"{algo} (mean of seeds)")
     ax.axhline(0, color="#C0392B", lw=1.2, ls="--", label="Hotel (actual prices)")
     ax.set_xticks(x); ax.set_xticklabels(groups)
-    ax.set_ylabel("Revenue vs hotel (%)")
+    ax.set_ylabel("Revenue vs hotel (%), test seasons")
     ax.set_title(title)
     ax.grid(axis="y", alpha=0.3)
     ax.legend()
@@ -302,10 +372,16 @@ def run_pipeline(model_name, args):
         f" {env.capacity} rooms ({env.online_avail.mean():.1f} online per night), "
         f"elasticity {args.elasticity}, BAR levels "
         f"EUR {env.prices[0]:.0f}-{env.prices[-1]:.0f} (reference: median BAR EUR {env.p_ref:.0f})",
+        f" Seasons: training = each seed's own stream; validation = seeds "
+        f"{VAL_SEED0}-{VAL_SEED0 + N_VAL - 1} (checkpoints), "
+        f"{VAL_SEED0}-{VAL_SEED0 + N_VAL_FIXED - 1} (best fixed price);",
+        f" test = seeds {TEST_SEED0}-{TEST_SEED0 + N_TEST - 1} (every reported number)",
         "=" * 72)
 
-    # 1. Hotel baseline + validation against the real season
+    # 1. Hotel baseline (test, validation) + validation of the simulator against the real season
     hotel, hotel_path = run_policy(env, hotel_policy, record_path=True)
+    hotel_val, _ = run_policy(env, hotel_policy, n=N_VAL_FIXED, seed0=VAL_SEED0)
+    hotel_ckpt = hotel_val["reward"].iloc[:N_VAL].mean()     # on the checkpoint seasons
     a = env.actual
     val = {k: hotel[col].mean() / a[k] - 1 for k, col in
            [("confirmed", "accepted"), ("room_nights", "room_nights"), ("revenue", "revenue")]}
@@ -313,15 +389,19 @@ def run_pipeline(model_name, args):
         f"  confirmed bookings  {val['confirmed']:+.1%}   room-nights {val['room_nights']:+.1%}"
         f"   revenue {val['revenue']:+.1%}")
 
-    # 2. Best fixed price
-    best, _, fixed = find_best_fixed(env)
-    out(f"Best fixed price: {PRICE_MULTIPLIERS[best]:.2f}x = BAR EUR {env.prices[best]:.0f}")
+    # 2. Best fixed price: chosen on validation, reported on test
+    best, fixed_val = find_best_fixed(env)
+    fixed, _ = run_policy(env, fixed_policy(best))
+    out(f"Best fixed price (chosen on {N_VAL_FIXED} validation seasons): "
+        f"{PRICE_MULTIPLIERS[best]:.2f}x = BAR EUR {env.prices[best]:.0f}")
     level = 100 * (fixed["reward"].mean() / hotel["reward"].mean() - 1)
+    fixed_val_gain = 100 * (fixed_val["reward"].mean() / hotel_val["reward"].mean() - 1)
 
-    # 3. Each RL algorithm, several seeds, evaluated on the same seasons
+    # 3. Each RL algorithm, several seeds, evaluated on the same test seasons
     rows = [summarise("Hotel (actual prices)", hotel, hotel, env),
-            summarise(f"Best fixed ({PRICE_MULTIPLIERS[best]:.2f}x)", fixed, hotel, env)]
-    comp_rows, rl_paths, dynamic = [], {}, {}
+            {**summarise(f"Best fixed ({PRICE_MULTIPLIERS[best]:.2f}x)", fixed, hotel, env),
+             "val_vs_hotel_%": fixed_val_gain}]
+    comp_rows, rl_paths, dynamic, curves_out = [], {}, {}, []
     for algo in args.algos:
         name = ALGOS[algo][2]
         seeds, n = args.seeds, len(args.seeds)
@@ -329,24 +409,36 @@ def run_pipeline(model_name, args):
         saves = [os.path.join(out_dir, f"{algo}_seed{s}") for s in seeds]
         jobs = min(args.jobs, n)
         print(f"Training {name} seeds {seeds} ({args.timesteps:,} steps, {jobs} in parallel)...")
-        task_args = ([algo] * n, seeds, log_dirs, saves, [env_kwargs] * n, [args.timesteps] * n)
+        task_args = ([algo] * n, seeds, log_dirs, saves, [env_kwargs] * n,
+                     [args.timesteps] * n, [args.eval_every] * n)
         if jobs > 1:
             with ProcessPoolExecutor(max_workers=jobs) as pool:
                 outs = list(pool.map(train_and_evaluate, *task_args))
         else:
             outs = list(map(train_and_evaluate, *task_args))
-        dfs = [df for df, _ in outs]
+        dfs = [o[0] for o in outs]
+        curves = [o[2] for o in outs]
         first_path = outs[0][1]
-        rows += [summarise(f"{name} seed {s}", df, hotel, env) for s, df in zip(seeds, dfs)]
+        for s, df, curve, step in zip(seeds, dfs, curves, [o[3] for o in outs]):
+            best_val = max(score for _, score in curve)
+            rows.append({**summarise(f"{name} seed {s}", df, hotel, env),
+                         "checkpoint_step": step, "val_reward": best_val,
+                         "val_vs_hotel_%": 100 * (best_val / hotel_ckpt - 1)})
+            curves_out += [{"algo": algo, "seed": s, "timesteps": t, "val_reward": r}
+                           for t, r in curve]
 
         mean_df = pd.concat(dfs).groupby(level=0).mean()
-        mean_row = summarise(f"{name} mean of {len(args.seeds)} seeds", mean_df, hotel, env)
+        mean_row = summarise(f"{name} mean of {n} seeds", mean_df, hotel, env)
+        mean_row["vs_hotel_se_%"], mean_row["vs_hotel_ci95_%"] = seed_se(dfs, hotel)
         rows.append(mean_row)
         rl_paths[name] = first_path
         dynamic[name] = 100 * (mean_df["reward"].mean() / fixed["reward"].mean() - 1)
+        dyn_se, dyn_ci = seed_se(dfs, fixed)
+        if n < 2:
+            out(f"  !!! {name}: one seed, so the error bars hold season noise only")
 
-        plot_learning(log_dirs, args.seeds, name, hotel["reward"].mean(),
-                      fixed["reward"].mean(),
+        plot_learning(log_dirs, curves, seeds, name, hotel_ckpt,
+                      fixed_val["reward"].iloc[:N_VAL].mean(),
                       os.path.join(out_dir, f"learning_curve_{algo}.png"),
                       f"{label} + {name} — learning curve, season {args.season}")
 
@@ -361,17 +453,22 @@ def run_pipeline(model_name, args):
             "rl_revenue": mean_df["revenue"].mean(),
             "rl_vs_hotel_%": mean_row["vs_hotel_%"],
             "rl_vs_hotel_se_%": mean_row["vs_hotel_se_%"],
+            "rl_vs_hotel_ci95_%": mean_row["vs_hotel_ci95_%"],
             "rl_vs_best_fixed_%": dynamic[name],
+            "rl_vs_best_fixed_se_%": dyn_se,
+            "rl_vs_best_fixed_ci95_%": dyn_ci,
             "rl_seed_spread_%": 100 * np.std([d["reward"].mean() for d in dfs])
                                 / hotel["reward"].mean(),
         })
 
     table = pd.DataFrame(rows)
     table.to_csv(os.path.join(out_dir, "results.csv"), index=False)
-    out("Results (same evaluation seasons for all policies; se = paired standard error):",
+    pd.DataFrame(curves_out).to_csv(os.path.join(out_dir, "validation_curve.csv"), index=False)
+    out("Results on the TEST seasons (val_* columns: validation seasons; se = paired, "
+        "mean-of-seeds rows include the variance between seeds):",
         table.to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
 
-    lines = ["Decomposition of the RL gain over the hotel:",
+    lines = ["Decomposition of the RL gain over the hotel (test seasons):",
              f"  price LEVEL  (best fixed vs hotel)      : {level:+.2f}%   "
              "<- elasticity assumption"]
     for name, dyn in dynamic.items():
@@ -383,18 +480,19 @@ def run_pipeline(model_name, args):
             out(f"  !!! {name} is below the best fixed price: it has not converged. "
                 "Increase --timesteps before drawing conclusions.")
 
-    # 4. Sensitivity (no training): best constant price vs hotel, by elasticity
+    # 4. Sensitivity (no training): best constant price chosen on validation, vs hotel on test
     if not args.no_sensitivity:
         sens = []
         for eps in SENSITIVITY_ELASTICITIES:
             e = HotelEnv(**{**env_kwargs, "elasticity": eps})
-            h, _ = run_policy(e, hotel_policy, n=SENSITIVITY_N_EVAL)
-            b, means, _ = find_best_fixed(e, n=SENSITIVITY_N_EVAL)  # same seasons: paired
+            b, _ = find_best_fixed(e)
+            h, _ = run_policy(e, hotel_policy, n=SENSITIVITY_N_EVAL)       # same seasons: paired
+            f, _ = run_policy(e, fixed_policy(b), n=SENSITIVITY_N_EVAL)
             sens.append({"elasticity": eps, "best_fixed_multiplier": PRICE_MULTIPLIERS[b],
-                         "best_fixed_vs_hotel_%": 100 * (means[b] / h["reward"].mean() - 1)})
+                         "best_fixed_vs_hotel_%": 100 * (f["reward"].mean() / h["reward"].mean() - 1)})
         sens = pd.DataFrame(sens)
         sens.to_csv(os.path.join(out_dir, "sensitivity.csv"), index=False)
-        out("Sensitivity — best constant price vs hotel, by elasticity:",
+        out("Sensitivity — best constant price (chosen on validation) vs hotel on test, by elasticity:",
             sens.to_string(index=False, float_format=lambda v: f"{v:.2f}"))
 
     plot_price_path(env, hotel_path, rl_paths, os.path.join(out_dir, "price_path.png"),
@@ -421,6 +519,8 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=SEEDS)
     ap.add_argument("--jobs", type=int, default=JOBS,
                     help="parallel processes (1 = sequential); at most one per seed")
+    ap.add_argument("--eval-every", type=int, default=EVAL_EVERY,
+                    help="training steps between validations of the greedy policy")
     ap.add_argument("--no-sensitivity", action="store_true")
     args = ap.parse_args()
 
@@ -432,7 +532,7 @@ def main():
                     f"ML model × RL algorithm vs hotel — season {args.season}")
 
     print("=" * 72)
-    print(f" FINAL COMPARISON — season {args.season}, elasticity {args.elasticity}")
+    print(f" FINAL COMPARISON — season {args.season}, elasticity {args.elasticity} (test seasons)")
     print("=" * 72)
     print(comp.drop(columns=["ml_model", "algo"])
               .to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
@@ -440,9 +540,10 @@ def main():
     print(" sim_vs_real_*      : how well each simulator reproduces the REAL season")
     print(" rl_vs_hotel_%      : RL revenue vs the hotel's actual pricing, its BAR (same seasons)")
     print(" rl_vs_best_fixed_% : value of day-by-day pricing (must be > 0 to claim it)")
+    print(" *_se_% / *_ci95_%  : include the variance between training seeds")
     top = comp.loc[comp["rl_vs_hotel_%"].idxmax()]
     print(f"\n Best combination: {top['pipeline']}  "
-          f"{top['rl_vs_hotel_%']:+.2f}% (se {top['rl_vs_hotel_se_%']:.2f}) vs hotel, "
+          f"{top['rl_vs_hotel_%']:+.2f}% (95% CI ±{top['rl_vs_hotel_ci95_%']:.2f}) vs hotel, "
           f"{top['rl_vs_best_fixed_%']:+.2f}% vs best fixed")
     print(f"\n Saved comparison_{tag}.csv / .png")
 
