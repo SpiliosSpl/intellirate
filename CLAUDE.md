@@ -56,7 +56,7 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    - **Guardrails (the run fails):**
      - **G1:** the tune and test seasons split the table, settings are chosen on `TUNE_SEASON` rows only, and every forecast comes from a model that never saw that date.
      - **G2:** at least `MIN_TEST_DAYS` uncensored test days.
-     - **G3:** the world's daily variance matches the real one within `WORLD_VAR_TOL` (1%).
+     - **G3:** the world's daily variance matches the real one within `WORLD_VAR_TOL` (1%). It is checked before `calibrate_to_availability`; the calibrated world the agents train in is 1.21–1.31× as volatile as reality (see the code review finding).
      - **G4:** the calibration converges within `CALIB_TOL`.
    - **Flagged checks (`!!!`, the run continues):**
      - a chosen config at an edge of `GRID` that is not a natural limit;
@@ -64,7 +64,7 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
      - a world with daily Spearman < 0.5, or any month outside 0.8–1.25 × actual before calibration.
 
    For each model it stores:
-   - `lambda_true`: the world fit, rescaled so that each season's total matches the real total. It is then recalibrated by `calibrate_to_availability`: one factor per season and model (≈ 1.14–1.19), chosen so that the simulator, at the hotel's prices and under the real online availability, sells the real number of room-nights (within 0.5%). Demand on nights closed online was never recorded. The factor does not depend on elasticity. It drives the simulated "world".
+   - `lambda_true`: the world fit, rescaled so that each season's total matches the real total. It is then recalibrated by `calibrate_to_availability`: one factor per season and model (≈ 1.14–1.19), chosen so that the simulator, at the hotel's prices and under the real online availability, sells the real number of room-nights (within 0.5%). Demand on nights closed online was never recorded. The factor does not depend on elasticity. It applies to every night, so fully recorded (uncensored) nights also get 11–14% more demand than really arrived. It drives the simulated "world".
    - `online_avail`: rooms on sale online each night, `capacity − (PMS rooms − confirmed BOOKINGS rooms)` clipped to [0, capacity] (`load_pms`, `online_availability`). 2026: on average 10.4 of 17 rooms, with 11 nights closed. 2025: 8.8 of 18, with 15 nights closed.
    - `lambda_forecast`: the forecaster's predictions, never in-sample. 2025 is out-of-fold, and 2026 comes from the model trained on 2025. The agent sees these as its forecast.
    - `dispersion_k`: the negative-binomial overdispersion of the simulated world's gamma shocks, **one per season and model**, stored in `seasons[year]["dispersion_k"][model]`. `None` means pure Poisson. Per season it is chosen so that the world's total daily variance equals the real one, `Var(y) = E[fit] + Var(fit) + E[fit²]/k`, because the in-sample fit already holds part of the data's noise. It is computed on the fit **after** the per-season rescale, so the match is exact (guardrail G3). (Taking `k` from the OOF residuals, as originally, counted that noise twice and made the world 24–59% more volatile than reality. A single shared `k` left 2026 −7 to −10% and 2025 +17 to +25%. Computing it before the rescale left up to 3% off.) Current values: 2026 ≈ 4.6 (rf) / 4.2 (xgb); 2025 xgb ≈ 16 and rf `None`, because the rf in-sample fit already carries all of 2025's variance. The `dispersion_k` column in `ml_comparison.csv` is the forecaster's 2025 OOF value: it sets the 80% interval coverage and describes forecast error, not the world.
@@ -115,11 +115,11 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
 - Rate parity across channels. NR is −10% everywhere. Booking.com Genius (−10%, flagged "Genius Booker" in `Channel Notes for Hotelier`), the Booking.com Last Minute Deal (−5%, in `Room Type Name`), the Expedia promos in `Rate` (Blue Member −10% in 2025, Member / Mobile −7% in 2026) and every other promo stack by multiplication. 2025 website: permanent −12% direct offer. 2026 website: member programme (`SmartGuest`) −10%, or −14.5% for bookings made from 1 Sep 2026 (those rates are rounded to the euro).
 - Occupancy pricing: see `rate_occupancy.csv`. BAR always means the double-occupancy BAR.
 - Flexible bookings cancel at a rate of about 36%, NR bookings at about 2%. `Cancel Fee` is always 0. In the simulator a cancelled profile earns nothing and never holds capacity.
-- The 2026 season is cut off at the export date (14 Oct, since the BOOKINGS refresh; it was 27 Sep), while 2025 runs to 31 Oct. The daily table starts at each season's first actual arrival (3 Apr in both seasons), not on 1 Apr.
+- The 2026 season is cut off at the export date (16 Oct, the latest `Booking Date` in the refreshed export; it was 27 Sep), while 2025 runs to 31 Oct. The PMS file stops at 14 Oct arrivals, so the last 2026 nights lack offline stays (see the code review finding). The daily table starts at each season's first actual arrival (3 Apr in both seasons), not on 1 Apr.
 - The hotel's online booking systems opened late in 2025, on about 1 Apr. About a third of the 2025 demand is therefore unrecorded, including about three quarters of April. **Decision: 2025 is kept as recorded, with no correction.** Treat 2026 as the main RL season, and describe 2025 as a limitation rather than fixing it.
 
 Other data files. Only the PMS file is used by the pipeline, and every private one is gitignored by pattern (`BOOKINGS.*`, `hotel_pms_data.*`, `avl-status*`, `kaggle_data.*`). `avl-status*` and `kaggle_data.*` are currently kept outside the repo folder.
-- `hotel_pms_data.csv`: the hotel PMS export of every STD stay, online and offline (arrivals 1 Apr 2025 – 14 Oct 2026). Format: Greek cp1253, `;`-separated, quoted. Title and filter lines come first, the header is on line 4, blank lines separate the records and two footer lines close the file. 28 rows carry one stray empty field after the arrival date. Columns: number, arrival, departure, room, price list (`Group` / `open` / `Compl` / `Over`), price, status, adults, children and source. There are no guest or debtor columns, but print the title and filter lines only by shape and save only per-night aggregates. The source tag misses about 30% of online stays, so identify online stays by subtracting BOOKINGS, not by the tag. **Used only for per-night online availability:** `load_pms` reads arrival, departure and room, and nothing else. Groups mostly booked before online sales opened, and offline bookings are typed in later from a paper calendar, so PMS entry dates are not booking dates. Room 108 is STD in 2025 only, as above.
+- `hotel_pms_data.csv`: the hotel PMS export of every STD stay, online and offline (arrivals 1 Apr 2025 – 14 Oct 2026). Format: Greek cp1253, `;`-separated, quoted. Title and filter lines come first, the header is on line 4, blank lines separate the records and two footer lines close the file. 28 rows carry one stray empty field after the arrival date. Columns: number, arrival, departure, room, price list (`Group` / `open` / `Compl` / `Over`), price, status, adults, children and source. There are no guest or debtor columns, but print the title and filter lines only by shape and save only per-night aggregates. The source tag misses about 30% of online stays, so identify online stays by subtracting BOOKINGS, not by the tag. **Used only for per-night online availability:** `load_pms` reads arrival, departure and room, and nothing else. Groups mostly booked before online sales opened, and offline bookings are typed in later from a paper calendar, so PMS entry dates are not booking dates. Room 108 is STD in 2025 only, as above, but the 2026 rows still hold 3 one-night stays in it. Confirmed online STD stays are missing from the PMS on 19 nights of 2026 (32 room-nights) and 5 of 2025, probably upgrades or room moves (see the code review finding).
 - `avl-status*.xlsx`: the booking engine's final availability per room type and night (1 Apr 2025 – 31 Oct 2026). `Classic Room` is the STD row. Cell fill: green = on sale, red = stop-sell, grey = 0. Values are exact only on 0 and red nights; elsewhere they are a lower bound. Online STD inventory is usually only about 4–8 rooms, and STD was sold out or stop-sold online on about 54 summer nights in 2026 (67 in 2025). Its file name and row 2 contain the hotel's name: match it by pattern, never print row 2, and keep it out of git.
 - `kaggle_data.xlsx`: the public Hotel Booking Demand dataset (Portugal, 2015–17). It is a candidate second case study (the Resort Hotel) for reproducibility, not training data. Its `adr` column is corrupted by the Excel conversion, so use the original CSV.
 
@@ -245,6 +245,34 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
   - Group stays move against online requests (weekly correlation −0.4 to −0.6, also on uncensored nights), and total PMS occupancy carries almost no signal (≈ +0.1).
   - As a prior-year pattern for 2026, every PMS index is significantly worse than the 2025 online month mean. Older PMS-only seasons (2023–24, no online channel) would therefore not help the demand model.
   - The offline calendar repeats strongly between years (weekly correlation 0.83, groups 0.87). Older PMS seasons are useful for modelling offline stays (varying availability between episodes), not demand.
+- **Code review (18 Oct 2026; read-only checks on a scratch copy, nothing applied):**
+  - **The calibration makes the world busier and more volatile than reality, also on fully recorded nights.** `calibrate_to_availability` scales every night of a season by one factor, and G3 is checked before it:
+
+    | World ÷ real | 2025 rf / xgb | 2026 rf / xgb |
+    |---|---|---|
+    | Requests, uncensored nights | 1.12 / 1.14 | 1.12 / 1.12 |
+    | Requests, censored nights | 1.27 / 1.35 | 1.69 / 1.78 |
+    | Daily variance after calibration | 1.21 / 1.25 | 1.29 / 1.31 |
+
+    The extra demand on uncensored nights is scarcity the real season didn't have, and scarcity is what lifts the best fixed price to 1.15–1.20× (most of the gain over the hotel). Statements that the world matches reality in variability hold only before calibration. Fix: the per-night censoring correction in future work (now its top priority); until then, also report G3 after calibration.
+  - **The level gain lies outside the hotel's observed prices.** The hotel's daily BAR stays within 0.92–1.13× `p_ref` in 2025 (142–175 €) and 0.92–1.11× in 2026 (147–177 €), while the best fixed price is 1.15–1.20× (2026: 184–192 €). The +1.6–1.7% level effect therefore extrapolates the assumed `g(p)` beyond any price in the data. Report a run with the multipliers limited to the observed range alongside it.
+  - **Data alignment** (each changes `online_avail`, so a fix needs an ML + RL rerun):
+    - The export date is 16 Oct 2026, but the PMS holds arrivals only up to 14 Oct. The night of 16 Oct has 0 PMS rooms, so all 17 rooms go on sale online, and 15 Oct misses that day's offline arrivals. Fix: cap the daily table at the PMS's last arrival, or fail when a date has no PMS coverage.
+    - On the nights where confirmed online stays are missing from the PMS (19 nights / 32 room-nights in 2026, 5 / 5 in 2025), `PMS − online` goes negative, is clipped to 0, and the whole hotel opens online. The same bias is invisible on other nights. Fix: flag it (`!!!`) and describe it as a limitation.
+    - Room 108's 3 stays in 2026 count as offline STD stays against a capacity of 17 that excludes it, and the PMS exceeds capacity on 2 nights per season (clipped). Fix: drop room 108 from the 2026 PMS rows.
+  - **Latent code issues (no effect on current results):**
+    - `load_rules` uses `.replace("", None)`: NaN in pandas 3 (checked), but pandas ≤ 2.x forward-fills the row above, which would silently shift booking-date windows (`web_member_sep` would never match). Use `.replace("", np.nan)`.
+    - `occupancy_class` falls back to `""` when people per room isn't a whole number (e.g. 3 adults in 2 rooms), which gives a silent NaN BAR. No such booking exists today.
+    - `load_bar` only checks booking IDs, so edited rate CSVs without a `bar_rates.py` rerun go unnoticed; an input hash would catch it.
+    - The "Best combination" line in `rl_agent.py` picks the maximum on the test seasons, against the protocol.
+    - `deviance_gain` shares one `rng` across models, so its CIs aren't paired between models and depend on call order. `rl_seed_spread_%` uses `ddof=0`, unlike every other SE.
+  - **Verified correct:**
+    - `DoubleDQN.train` matches SB3 2.8.0's `DQN.train` line for line, apart from the target.
+    - A deterministic `predict` draws no random numbers (DQN skips `np.random.rand()`).
+    - `VecNormalize` reward normalisation is valid for both algorithms.
+    - The Orthodox Easter dates are right (20 Apr 2025, 12 Apr 2026).
+    - Mean rooms per booking is 1.002, so `lambda` counting rooms while the env draws bookings makes no difference.
+  - **Efficiency:** greedy evaluation spends about 320 of its 380 µs per step in SB3's single-observation `predict`. Stepping the 50 validation seasons in lockstep, with one batched `predict` per day, gave bit-identical rewards (PPO and Double DQN seed-42 checkpoints) and was 3–4× faster (3.7 → 1.0 s per validation). Use it for `ValidationCheckpoint` and the test runs.
 - **Elasticity:** keep 1.0 as the main scenario. Per the hotel, its main competitor is usually 5–15% cheaper for this room type (sometimes more expensive), so ε well below 1 would imply implausible premiums; report about 0.8–1.5 as sensitivity. The data that would most improve results: the hotel's real nightly availability across all channels, and competitor prices per date.
 
 Cross-file contracts: `bar_rates.py` imports `load_raw`, `SEASONS` and `SUMMER` from `ml_demand_model.py`, which in turn reads `bar_daily.csv` / `bar_bookings.csv` (`load_bar` fails loudly if they are missing or don't cover every booking: re-run `bar_rates.py` after changing `BOOKINGS.xlsx`, the rate CSVs or the load filters). `rl_agent.py` imports `PRICE_MULTIPLIERS` from the env. The env depends on the exact `sim_data.pkl` schema produced by `build_sim_data` (per season: `capacity`, `online_avail`, `dispersion_k`, `dates`, `lambda_true`, `lambda_forecast`, `hotel_price`, `p_ref`, calendar arrays, `profiles`, `actual`; top level: `seasons`, `models`), so after changing that schema, `BOOKINGS.xlsx` or `hotel_pms_data.csv`, you must re-run `ml_demand_model.py`. `ml_demand_model.py` imports `HotelEnv` (inside `calibrate_to_availability`) to calibrate. Model keys `"rf"` / `"xgb"` are shared across the ML, env and RL files.
@@ -252,11 +280,29 @@ Cross-file contracts: `bar_rates.py` imports `load_raw`, `SEASONS` and `SUMMER` 
 ## Possible realism upgrades (future work)
 
 None of these is implemented. They are recorded as directions and as limitations for the thesis.
+
+**Priority order** (code review, 18 Oct 2026; effort 1 = quick … 5 = long):
+1. per-night censoring correction (4);
+2. price-range check (1–2);
+3. upper-bound benchmark (2);
+4. robustness tests (2–3);
+5. contextual-bandit baseline (2–3);
+6. booking lead time (5);
+7. booking-pace feature (3);
+8. more seeds and one process pool (1);
+9. tests and input hashes (2);
+10. RL hyperparameter tuning (3);
+11. varying offline calendars (3–4);
+12. learned price response (5);
+13. second case study (4);
+14. smaller items (3).
 - **Booking lead time:** one step is one arrival date with one price, so every request for a night arrives at once. Spreading requests over a booking window (built from the real lead times in BOOKINGS) and letting the agent reprice would be the biggest gain in realism. It needs a new env design.
 - **7-night availability in the observation:** tested under PMS scarcity with no gain (see the findings). Worth revisiting only together with varying availability between episodes.
 - **Learned price response:** the ML models never see price, and the elasticity in `g(p)` is assumed. Competitor prices per date would make it possible to estimate it.
 - **Varying availability between episodes:** every episode uses the same real offline calendar, so generalisation to other group calendars is untested.
-- **Per-night censoring correction:** demand on nights closed online is unrecorded, and the recalibration uses one factor per season and model.
+- **Per-night censoring correction (top priority):** demand on nights closed online is unrecorded, and the recalibration uses one factor per season and model. That also inflates fully recorded nights by 11–14% and the world's variance to 1.2–1.3× real (see the code review finding). Scale only censored nights, or fit the world with a censored likelihood, then recheck G3 after calibration.
+- **Price-range check:** a run with the multipliers limited to the hotel's observed range (≈ 0.92–1.13×), to show how much of the level gain is extrapolation of the assumed elasticity.
+- **Day-by-day benchmarks:** an upper bound (perfect foresight or a capacity-aware rule) and a contextual-bandit baseline (the MDP is close to one). Together they separate "RL is weak" from "the simulator holds no day-by-day value".
 - **RL robustness tests (next RL step; the `val-test` protocol, its first part, is done):** agents are tested only in their own training world, so overfitting to the simulator goes undetected.
   - **Plan:** a `--robustness` flag, off by default and evaluation only. It tests each selected checkpoint, the hotel and the best fixed price (chosen under the training assumptions) on the test seasons in:
     - the other ML world (the agent keeps its own forecast);
