@@ -29,9 +29,9 @@ SEASON      = 2026
 MODELS      = ["rf", "xgb"]
 MODEL_NAMES = {"rf": "ML1 RF", "xgb": "ML2 XGB"}
 ELASTICITY  = 1.0
-TIMESTEPS   = 300_000              # per algorithm and seed
-SEEDS       = [42, 7, 123]
-JOBS        = 3                    # parallel processes: the seeds of one ML x RL train together
+TIMESTEPS   = 900_000              # per algorithm and seed
+SEEDS       = [42, 7, 123, 1, 2024]
+JOBS        = 5                    # parallel processes: the seeds of one ML x RL train together
 
 # Simulated seasons by role, told apart by their seed. Training uses each training
 # seed's own SB3 stream. Validation chooses (checkpoints, best fixed price); test is
@@ -44,15 +44,20 @@ N_TEST      = 200
 EVAL_EVERY  = 25_000               # training steps between validations of the greedy policy
 assert VAL_SEED0 + max(N_VAL, N_VAL_FIXED) <= TEST_SEED0, "validation and test seasons overlap"
 
+# Low gamma / GAE lambda: today's price barely affects later days (mean stay 1.26
+# nights), so a long horizon only adds future demand noise to each advantage.
+# gamma, gae_lambda and the Double DQN changes below were chosen on a small
+# validation grid (300k steps, rf world, 3 seeds; see CLAUDE.md).
 PPO_PARAMS = dict(learning_rate=3e-4, n_steps=2048, batch_size=256,
-                  n_epochs=10, gamma=0.99, ent_coef=0.01)
+                  n_epochs=10, gamma=0.9, gae_lambda=0.5, ent_coef=0.01)
 
-# Double DQN: every setting is written out (not left to SB3 defaults). The dict
-# is unchanged from the DQN that Double DQN replaced, so the TD target is the
-# only difference between the two. Same network size as PPO.
-DQN_PARAMS = dict(learning_rate=1e-4, buffer_size=100_000, learning_starts=5_000,
-                  batch_size=128, gamma=0.99, train_freq=4, gradient_steps=1,
-                  target_update_interval=2_000, tau=1.0,
+# Double DQN: every setting is written out (not left to SB3 defaults). Batch 512,
+# gamma 0.9, a soft target update every gradient step and a decaying learning
+# rate were tested together, not one by one. Same network size as PPO.
+DQN_PARAMS = dict(learning_rate=lambda p: 1e-4 * p,     # p: progress remaining, 1 -> 0
+                  buffer_size=100_000, learning_starts=5_000,
+                  batch_size=512, gamma=0.9, train_freq=4, gradient_steps=1,
+                  target_update_interval=4, tau=0.005,
                   exploration_fraction=0.3, exploration_initial_eps=1.0,
                   exploration_final_eps=0.02, max_grad_norm=10,
                   policy_kwargs=dict(net_arch=[64, 64]))
@@ -401,7 +406,7 @@ def run_pipeline(model_name, args):
     rows = [summarise("Hotel (actual prices)", hotel, hotel, env),
             {**summarise(f"Best fixed ({PRICE_MULTIPLIERS[best]:.2f}x)", fixed, hotel, env),
              "val_vs_hotel_%": fixed_val_gain}]
-    comp_rows, rl_paths, dynamic, curves_out = [], {}, {}, []
+    comp_rows, rl_paths, dynamic, vs_hotel, curves_out = [], {}, {}, {}, []
     for algo in args.algos:
         name = ALGOS[algo][2]
         seeds, n = args.seeds, len(args.seeds)
@@ -431,6 +436,7 @@ def run_pipeline(model_name, args):
         mean_row = summarise(f"{name} mean of {n} seeds", mean_df, hotel, env)
         mean_row["vs_hotel_se_%"], mean_row["vs_hotel_ci95_%"] = seed_se(dfs, hotel)
         rows.append(mean_row)
+        vs_hotel[name] = mean_row["vs_hotel_%"]
         rl_paths[name] = first_path
         dynamic[name] = 100 * (mean_df["reward"].mean() / fixed["reward"].mean() - 1)
         dyn_se, dyn_ci = seed_se(dfs, fixed)
@@ -471,9 +477,9 @@ def run_pipeline(model_name, args):
     lines = ["Decomposition of the RL gain over the hotel (test seasons):",
              f"  price LEVEL  (best fixed vs hotel)      : {level:+.2f}%   "
              "<- elasticity assumption"]
-    for name, dyn in dynamic.items():
-        lines.append(f"  DAY-BY-DAY   ({name + ' vs best fixed)':26s}: {dyn:+.2f}%   "
-                     "<- value of dynamic pricing")
+    for name, gain in vs_hotel.items():
+        lines.append(f"  RL vs HOTEL  ({name + ' vs hotel)':26s}: {gain:+.2f}%   "
+                     "<- level + day-by-day")
     out(*lines)
     for name, dyn in dynamic.items():
         if dyn < -0.3:
