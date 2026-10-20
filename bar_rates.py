@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import PercentFormatter
 
 from ml_demand_model import load_raw, SEASONS, SUMMER
 
@@ -17,6 +18,7 @@ BOOKINGS_OUT   = "bar_bookings.csv"
 DAILY_OUT      = "bar_daily.csv"
 REPORT_OUT     = "bar_validation.txt"
 PLOT_OUT       = "bar_daily.png"
+PLOT_PCT_OUT   = "bar_daily_pct.png"
 
 CHILD_CHARGED_FROM = 4     # children aged >= 4 pay as adults
 LADDER_STEP        = 0.5   # rates are set to the half euro
@@ -441,18 +443,33 @@ def report(df, daily, ladders, rules, occ, hits):
     return "\n".join(out)
 
 
-def plot(df, daily, path=PLOT_OUT):
+def p_ref(df, daily, season):
+    """The simulator's reference price (multiplier 1.00): the median daily BAR
+    over the season's arrival dates, as in ml_demand_model.build_sim_data."""
+    a = df.loc[df["season"] == season, "arrival"]
+    return daily.loc[a.min():a.max(), "bar"].median()
+
+
+def plot(df, daily, path=PLOT_OUT, pct=False):
+    """Prices in EUR, or (pct) in % of the season's reference price p_ref."""
     fig, axes = plt.subplots(len(SEASONS), 1, figsize=(12, 3.8 * len(SEASONS)))
     for ax, s in zip(np.atleast_1d(axes), SEASONS):
         d = daily[daily["season"] == s]
         b = df[(df["season"] == s) & (df["nights"] == 1)]
-        ax.scatter(b["arrival"], b["price"], s=8, color="#bbb", label="Recorded price (1-night stays)")
-        ax.scatter(b["arrival"], b["bar"], s=8, color="#2E75B6", alpha=0.6, label="Implied BAR (1-night stays)")
-        ax.plot(d.index, recorded_price(df[df["season"] == s], d.index), color="#888", lw=1.2,
+        ref = p_ref(df, daily, s)
+        k = 100 / ref if pct else 1
+        ax.scatter(b["arrival"], b["price"] * k, s=8, color="#bbb", label="Recorded price (1-night stays)")
+        ax.scatter(b["arrival"], b["bar"] * k, s=8, color="#2E75B6", alpha=0.6, label="Implied BAR (1-night stays)")
+        ax.plot(d.index, recorded_price(df[df["season"] == s], d.index) * k, color="#888", lw=1.2,
                 ls="--", label="Old hotel price (recorded, 7-day median)")
-        ax.plot(d.index, d["bar"], color="#C0392B", lw=1.8, label="Daily BAR (double)")
-        ax.set_title(f"Reconstructed BAR — STD, season {s}")
-        ax.set_ylabel("EUR / night")
+        ax.plot(d.index, d["bar"] * k, color="#C0392B", lw=1.4, label="Daily BAR (double)")
+        if pct:
+            ax.set_title(f"Reconstructed BAR — season {s} (100% = median daily BAR)")
+            ax.set_ylabel("% of median daily BAR")
+            ax.yaxis.set_major_formatter(PercentFormatter(decimals=0))
+        else:
+            ax.set_title(f"Reconstructed BAR — season {s}")
+            ax.set_ylabel("EUR / night")
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8, loc="lower center", ncol=2)
     plt.tight_layout()
@@ -486,7 +503,8 @@ if __name__ == "__main__":
     with open(REPORT_OUT, "w", encoding="utf-8") as f:
         f.write(text + "\n")
     plot(df, daily)
+    plot(df, daily, PLOT_PCT_OUT, pct=True)
 
     print(text)
-    print(f"\n  Saved: {BOOKINGS_OUT}, {DAILY_OUT}, {REPORT_OUT}, {PLOT_OUT}")
+    print(f"\n  Saved: {BOOKINGS_OUT}, {DAILY_OUT}, {REPORT_OUT}, {PLOT_OUT}, {PLOT_PCT_OUT}")
     print("  Next: python ml_demand_model.py")

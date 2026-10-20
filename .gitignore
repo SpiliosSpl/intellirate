@@ -8,7 +8,7 @@ kaggle_data.*
 bar_bookings.csv
 bar_daily.csv
 bar_validation.txt
-bar_daily.png
+bar_daily*.png
 *.pkl
 ml_comparison.csv
 ml_cv_grid.csv
