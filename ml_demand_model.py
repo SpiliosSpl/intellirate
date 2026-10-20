@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import re
 import warnings
 
@@ -27,18 +28,26 @@ XLSX_PATH = "BOOKINGS.xlsx"
 ROOM_TYPE = "STD"
 SEASONS   = [2025, 2026]
 SUMMER    = ("04-01", "10-31")      # arrivals studied in every season (MM-DD)
-CAPACITY  = {2025: 18, 2026: 17}    # physical STD rooms (room 108 left STD after 2025)
+# Physical STD rooms per season (room 108 left STD after 2025)
+STD_ROOMS = {2025: ["101", "102", "103", "104", "108"] + [str(r) for r in range(301, 314)],
+             2026: ["101", "102", "103", "104"] + [str(r) for r in range(301, 314)]}
+CAPACITY  = {s: len(rooms) for s, rooms in STD_ROOMS.items()}
 
 PII_COLUMNS = ["First Name", "Last Name", "Email", "Telephone", "Card",
                "Guest's Company", "Geo", "Location", "Region", "External ID"]
 
-# Reconstructed Best Available Rate (output of bar_rates.py)
-BAR_DAILY_PATH    = "bar_daily.csv"     # double-occupancy BAR per stay night
-BAR_BOOKINGS_PATH = "bar_bookings.csv"  # BAR each booking was priced from
+# Reconstructed Best Available Rate (output of bar_rates.py, in BAR_DIR)
+BAR_DIR           = "bar_exports"
+BAR_DAILY_PATH    = f"{BAR_DIR}/bar_daily.csv"     # double-occupancy BAR per stay night
+BAR_BOOKINGS_PATH = f"{BAR_DIR}/bar_bookings.csv"  # BAR each booking was priced from
+BAR_INPUTS_PATH   = f"{BAR_DIR}/bar_inputs.sha256" # hashes of the files bar_rates.py read
 
-# Hotel PMS export: every STD stay, online and offline. Only arrival, departure
-# and room are read, to find the rooms left for online sale each night.
-PMS_PATH = "hotel_pms_data.csv"
+# Hotel PMS export: every STD stay, online and offline. Only arrival, departure,
+# room and status are read, to find the rooms left for online sale each night.
+PMS_PATH   = "hotel_pms_data.csv"
+PMS_HEADER = ["Αρ.", "Άφιξη", "Αναχώρηση", "Δωμάτιο", "Τιμοκατάλογος", "Τιμή",
+              "Κατάσταση", "A", "C", "Πηγή"]
+PMS_STATUS = {"IN": True, "OUT": True}  # holds a room? (in house, checked out); others fail
 
 # Fixed model parameters; the rest come from WORLD_PARAMS or GRID
 RF_PARAMS = dict(n_estimators=500, random_state=42, n_jobs=-1)
@@ -116,15 +125,27 @@ def load_raw(path=XLSX_PATH):
     return df, export_date
 
 
+def file_hash(path):
+    """SHA-256 of a file: bar_rates.py records its inputs, load_bar checks them."""
+    with open(path, "rb") as fh:
+        return hashlib.file_digest(fh, "sha256").hexdigest()
+
+
 def load_bar(bk):
     """From bar_rates.py: the daily BAR (Series by date) and each booking's
     reference BAR (aligned with bk). Fails loudly when the files are missing
-    or out of date."""
+    or out of date (an input changed since bar_rates.py ran)."""
     try:
         daily = pd.read_csv(BAR_DAILY_PATH, parse_dates=["date"]).set_index("date")["bar"]
         per_booking = pd.read_csv(BAR_BOOKINGS_PATH).set_index("ID")["bar_ref"]
+        with open(BAR_INPUTS_PATH, encoding="utf-8") as fh:
+            inputs = [line.split("  ", 1) for line in fh.read().splitlines()]
     except FileNotFoundError as exc:
         raise FileNotFoundError(f"{exc.filename} not found: run python bar_rates.py first") from exc
+    changed = [path for digest, path in inputs if file_hash(path) != digest]
+    if changed:
+        raise ValueError(f"{', '.join(changed)} changed since bar_rates.py ran: "
+                         "re-run python bar_rates.py")
     bar_ref = bk["ID"].astype("int64").map(per_booking)
     if bar_ref.isna().any():
         raise ValueError(f"{bar_ref.isna().sum()} bookings have no BAR: re-run python bar_rates.py "
@@ -133,18 +154,45 @@ def load_bar(bk):
 
 
 def load_pms(path=PMS_PATH):
-    """Every STD stay in the hotel PMS, online and offline: arrival, departure
-    and room only (one room per row). Nothing else in the file is used. Some
-    rows carry one stray empty field after the arrival date."""
+    """Every STD stay in the hotel PMS, online and offline, whose status holds
+    a room: arrival, departure and room (one room per row). Fails on a changed
+    header, a malformed row, an unknown status or a room that is STD in no
+    season, instead of guessing. Stays in a room that is STD in another season
+    only (108 in 2026) are dropped. Some rows carry one stray empty field after
+    the arrival date."""
     with open(path, encoding="cp1253", newline="") as fh:
         rows = list(csv.reader(fh, delimiter=";"))
+    if not any(r[:len(PMS_HEADER)] == PMS_HEADER for r in rows):
+        raise ValueError(f"{path}: header changed (expected {PMS_HEADER})")
     is_date = re.compile(r"\d{1,2}/\d{1,2}/\d{4}").fullmatch
-    stays = [[v for v in r[1:5] if v][:3] for r in rows if len(r) >= 10 and is_date(r[1])]
-    pms = pd.DataFrame(stays, columns=["arrival", "departure", "room"])
+    stays = [r[:2] + r[3:] if len(r) == len(PMS_HEADER) + 1 and r[2] == "" else r
+             for r in rows if len(r) > 1 and is_date(r[1])]
+    bad = sum(len(r) != len(PMS_HEADER) for r in stays)
+    if bad:
+        raise ValueError(f"{path}: {bad} stay rows do not have {len(PMS_HEADER)} fields")
+    pms = pd.DataFrame(stays).iloc[:, [1, 2, 3, 6]]
+    pms.columns = ["arrival", "departure", "room", "status"]
     for col in ("arrival", "departure"):
         pms[col] = pd.to_datetime(pms[col], format="%d/%m/%Y")
+    if (pms["departure"] <= pms["arrival"]).any():
+        raise ValueError(f"{path}: {(pms['departure'] <= pms['arrival']).sum()} stays "
+                         "end on or before their arrival")
+    unknown = set(pms["status"]) - set(PMS_STATUS)
+    if unknown:
+        raise ValueError(f"{path}: unknown status {sorted(unknown)}: add it to PMS_STATUS")
+    pms = pms[pms["status"].map(PMS_STATUS)]
+    never = set(pms["room"]) - set().union(*STD_ROOMS.values())
+    if never:
+        raise ValueError(f"{path}: rooms {sorted(never)} are STD in no season")
+    std = np.array([room in STD_ROOMS.get(a.year, ()) for room, a in zip(pms["room"], pms["arrival"])])
+    if not std.all():
+        other = pms[~std]
+        dropped = other.groupby([other["arrival"].dt.year, other["room"]]).size()
+        print("  PMS: dropped stays in rooms not STD that season: "
+              + ", ".join(f"{y} room {r} ({n})" for (y, r), n in dropped.items()))
+    pms = pms[std].copy()
     pms["rooms"] = 1
-    return pms
+    return pms[["arrival", "departure", "room", "rooms"]].reset_index(drop=True)
 
 
 def nightly_rooms(stays):
@@ -155,13 +203,38 @@ def nightly_rooms(stays):
     return s["rooms"].groupby(night.values).sum()
 
 
+def occupied_rooms(pms, dates):
+    """Rooms occupied in the PMS each night of dates. A room holds one stay
+    per night, so a room-night entered twice counts once (flagged)."""
+    s = pms.loc[pms.index.repeat((pms["departure"] - pms["arrival"]).dt.days)]
+    night = s["arrival"] + pd.to_timedelta(s.groupby(level=0).cumcount(), unit="D")
+    room_nights = pd.DataFrame({"night": night.values, "room": s["room"].values})
+    twice = room_nights.duplicated()
+    n_twice = (twice & room_nights["night"].isin(dates)).sum()
+    if n_twice:
+        print(f"  !!! {dates[0].year}: {n_twice} PMS room-nights held by two stays (counted once)")
+    return room_nights[~twice].groupby("night").size().reindex(dates, fill_value=0)
+
+
 def online_availability(bk, pms, dates, capacity):
     """Rooms left for online sale each night. Offline stays are the PMS stays
     not in the channel manager: capacity - (PMS rooms - confirmed online
-    rooms), clipped to [0, capacity]."""
+    rooms), clipped to [0, capacity]. The PMS must cover every date (its first
+    to its last arrival). Where it holds fewer rooms than the confirmed online
+    stays (upgrades or room moves), no offline stay is left and the whole
+    hotel opens online: flagged."""
+    first, last = pms["arrival"].min(), pms["arrival"].max()
+    if dates[0] < first or dates[-1] > last:
+        raise ValueError(f"The PMS covers arrivals {first.date()} -> {last.date()}, "
+                         f"not {dates[0].date()} -> {dates[-1].date()}")
     online = nightly_rooms(bk[bk["is_cancelled"] == 0]).reindex(dates, fill_value=0)
-    offline = (nightly_rooms(pms).reindex(dates, fill_value=0) - online).clip(0, capacity)
-    return (capacity - offline).to_numpy(int)
+    offline = occupied_rooms(pms, dates) - online
+    short = offline < 0
+    if short.any():
+        print(f"  !!! {dates[0].year}: the PMS holds fewer rooms than the confirmed online stays "
+              f"on {short.sum()} nights ({-offline[short].sum()} room-nights): no offline stays "
+              "there, so the whole hotel opens online")
+    return (capacity - offline.clip(0, capacity)).to_numpy(int)
 
 
 def add_availability(daily, bk, pms):
@@ -580,11 +653,16 @@ def plot_fit(daily, results, path="demand_fit.png"):
 
 if __name__ == "__main__":
     bk, export_date = load_raw()
-    bar_daily, bk["bar_ref"] = load_bar(bk)
     pms = load_pms()
+    # Offline stays are known only up to the PMS's last arrival: the table ends there
+    pms_end = pms["arrival"].max()
+    n_late = (bk["arrival"] > pms_end).sum()
+    bk = bk[bk["arrival"] <= pms_end].copy()
+    bar_daily, bk["bar_ref"] = load_bar(bk)
     print("=" * 66)
     print(f"  Bookings: {len(bk)} STD, summer arrivals {SUMMER[0]} -> {SUMMER[1]} "
-          f"(export date {export_date.date()}; later stay dates excluded)")
+          f"(export date {export_date.date()},\n  PMS last arrival {pms_end.date()}: "
+          f"{n_late} bookings arriving later excluded)")
     print("=" * 66 + "\n")
 
     daily = add_availability(build_daily(bk, bar_daily), bk, pms)

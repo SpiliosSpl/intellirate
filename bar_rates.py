@@ -1,11 +1,25 @@
+import os
+
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.colors import to_hex, to_rgba
 from matplotlib.ticker import PercentFormatter
+import zipfile
+from openpyxl.chart import ScatterChart, Reference, Series
+from openpyxl.chart.layout import Layout, ManualLayout
+from openpyxl.chart.shapes import GraphicalProperties
+from openpyxl.chart.text import RichText, Text
+from openpyxl.chart.title import Title
+from openpyxl.drawing.line import LineProperties
+from openpyxl.drawing.spreadsheet_drawing import AbsoluteAnchor
+from openpyxl.drawing.text import CharacterProperties, Font, Paragraph, ParagraphProperties, RegularTextRun
+from openpyxl.drawing.xdr import XDRPoint2D, XDRPositiveSize2D
 
-from ml_demand_model import load_raw, SEASONS, SUMMER
+from ml_demand_model import load_raw, file_hash, SEASONS, SUMMER, XLSX_PATH, BAR_DIR
 
 
 # =============================================================================
@@ -14,11 +28,14 @@ from ml_demand_model import load_raw, SEASONS, SUMMER
 
 RULES_PATH     = "rate_rules.csv"
 OCCUPANCY_PATH = "rate_occupancy.csv"
-BOOKINGS_OUT   = "bar_bookings.csv"
-DAILY_OUT      = "bar_daily.csv"
-REPORT_OUT     = "bar_validation.txt"
-PLOT_OUT       = "bar_daily.png"
-PLOT_PCT_OUT   = "bar_daily_pct.png"
+# Every output goes to BAR_DIR (bar_exports/)
+BOOKINGS_OUT   = f"{BAR_DIR}/bar_bookings.csv"
+DAILY_OUT      = f"{BAR_DIR}/bar_daily.csv"
+REPORT_OUT     = f"{BAR_DIR}/bar_validation.txt"
+PLOT_OUT       = f"{BAR_DIR}/bar_daily.png"
+PLOT_PCT_OUT   = f"{BAR_DIR}/bar_daily_pct.png"
+INPUTS_OUT     = f"{BAR_DIR}/bar_inputs.sha256"   # hashes of the inputs, checked by ml_demand_model.load_bar
+EXCEL_FONT     = "Verdana" # Excel copies of the plots: nearest Windows font to matplotlib's DejaVu Sans
 
 CHILD_CHARGED_FROM = 4     # children aged >= 4 pay as adults
 LADDER_STEP        = 0.5   # rates are set to the half euro
@@ -58,7 +75,7 @@ def load_rules(path=RULES_PATH):
     rules["factor"] = rules["factor"].astype(float)
     rules["round_to"] = pd.to_numeric(rules["round_to"].replace("", "0"))
     for c in ("book_from", "book_to"):
-        rules[c] = pd.to_datetime(rules[c].replace("", None))
+        rules[c] = pd.to_datetime(rules[c].replace("", np.nan))
     return rules
 
 
@@ -260,6 +277,9 @@ def reconstruct(base, rules, occ, nightly=None):
     ladders = build_ladders(df, occ, exclude=cand | df["charged_kids_room"].isna().values)
 
     infer_occupancy(df, occ, ladders, nightly)
+    if (df["occupancy"] == "").any():          # else a silent NaN BAR
+        raise ValueError(f"{(df['occupancy'] == '').sum()} bookings have no occupancy class "
+                         "(people per room is not a whole number)")
     infer_rules(df, rules, hits, ladders, nightly)
     ladders = build_ladders(df, occ, exclude=np.zeros(len(df), dtype=bool))
     near, df["on_ladder"] = nearest_level(df, df["occ_price"], df["occupancy"], ladders)
@@ -450,17 +470,175 @@ def p_ref(df, daily, season):
     return daily.loc[a.min():a.max(), "bar"].median()
 
 
+def excel_plot(fig, panels, path):
+    """The figure as editable Excel charts: sheet 'charts' has one chart per
+    season, drawn from that season's data sheet. Size, plot area, axis ranges,
+    ticks, title, legend, colours, transparency, markers and lines are copied
+    from the matplotlib figure. Excel ticks start at the axis minimum, so each
+    axis starts at the last tick before the data instead of matplotlib's margin."""
+    emu_pt, emu_in = 12700, 914400
+    offset = mdates.date2num(pd.Timestamp("1899-12-30"))   # matplotlib -> Excel date
+    inv = fig.transFigure.inverted()
+    renderer = fig.canvas.get_renderer()
+    n = len(panels)
+    alphas = {}                                            # colour -> alpha, set in the XML below
+    # Excel keeps half the widest date label inside the chart (matplotlib lets
+    # it reach the margin): widen each chart on the right only, so the plot area
+    # keeps matplotlib's size and position
+    w, h = fig.get_size_inches()
+    label = max(t.get_window_extent(renderer).width for p in panels for t in p[0].get_xticklabels()) / fig.dpi
+    right = w * (1 - max(p[0].get_position().x1 for p in panels))
+    cw = w + max(0.0, 1.25 * label / 2 + 5 / 72 - right)   # chart width, inches
+    sx = w / cw
+
+    def colour(c, alpha=None):
+        rgba = to_rgba(c, alpha)
+        hexc = to_hex(rgba[:3]).lstrip("#").upper()
+        if rgba[3] < 1:
+            alphas[hexc] = rgba[3]
+        return hexc
+
+    def font(size):
+        return CharacterProperties(sz=round(size * 100), b=False, solidFill="000000",
+                                   latin=Font(typeface=EXCEL_FONT))
+
+    def rich(size):
+        return RichText(p=[Paragraph(pPr=ParagraphProperties(defRPr=font(size)), endParaRPr=font(size))])
+
+    def extent(artist):
+        return artist.get_window_extent(renderer).transformed(inv)
+
+    def place(bb, i, size=True, target=None):
+        """A figure-fraction box as a fraction of panel i's chart."""
+        return Layout(manualLayout=ManualLayout(
+            layoutTarget=target, xMode="edge", yMode="edge", x=bb.x0 * sx, y=(1 - i / n - bb.y1) * n,
+            w=bb.width * sx if size else None, h=bb.height * n if size else None))
+
+    def title(text, i=None):
+        """Placed where matplotlib has it, or (i None) by Excel."""
+        p = Paragraph(pPr=ParagraphProperties(defRPr=font(text.get_fontsize())),
+                      r=[RegularTextRun(rPr=font(text.get_fontsize()), t=text.get_text())])
+        return Title(tx=Text(rich=RichText(p=[p])), overlay=False,
+                     layout=None if i is None else place(extent(text), i, size=False))
+
+    def line(artist):   # a Line2D, or a patch's edge (spine, legend frame)
+        c = artist.get_color() if hasattr(artist, "get_color") else artist.get_edgecolor()
+        lw = artist.get_linewidth()
+        ln = LineProperties(solidFill=colour(c, artist.get_alpha()), w=round(lw * emu_pt))
+        if artist.get_linestyle() == "--":   # set to matplotlib's dashes in the XML below
+            ln.prstDash = "dash"
+        return ln
+
+    def scale(axis, ax, lim, ticks, lo, months=False):
+        """Excel axis from matplotlib's ax: range from the last tick <= the data
+        to matplotlib's limit; ticks at matplotlib's spacing (months: the step
+        whose multiples land on each month's first day)."""
+        ticks = np.array([t for t in ticks if lim[0] <= t <= lim[1]])
+        if months:
+            ticks = ticks[ticks >= ticks[ticks <= lo].max()]
+            step, k = np.diff(ticks), np.arange(len(ticks))
+            unit = next(u for u in np.arange(step.min(), step.max() + 0.01, 0.01)
+                        if (np.floor(ticks[0] + k * u) == ticks).all())
+            start = ticks[0]
+        else:
+            unit = ticks[1] - ticks[0]
+            start = ticks[0] + unit * np.floor((lo - ticks[0]) / unit)
+            if lim[0] - start > unit / 2:   # too far below matplotlib's limit: half steps
+                unit /= 2
+                start = ticks[0] + unit * np.floor((lo - ticks[0]) / unit)
+        axis.scaling.min, axis.scaling.max, axis.majorUnit = start, lim[1], unit
+        axis.delete = False
+        axis.majorTickMark = "out"
+        axis.txPr = rich(ax.get_xticklabels()[0].get_fontsize())
+        axis.spPr = GraphicalProperties(ln=line(ax.spines["bottom"]))
+        axis.majorGridlines.spPr = GraphicalProperties(ln=line(ax.xaxis.get_gridlines()[0]))
+
+    with pd.ExcelWriter(path, datetime_format="yyyy-mm-dd") as xl:
+        charts = xl.book.create_sheet("charts")
+        for i, (ax, s, nights, stays) in enumerate(panels):
+            nights.to_excel(xl, sheet_name=str(s), index_label="date")
+            stays.to_excel(xl, sheet_name=str(s), startcol=4, index=False)
+            ws = xl.sheets[str(s)]
+
+            ch = ScatterChart()
+            ch.title = title(ax.title, i)
+            ch.y_axis.title = title(ax.yaxis.label)   # Excel's tick labels are wider: let it place this
+            ch.layout = place(ax.get_position(), i, target="inner")
+            ch.graphical_properties = GraphicalProperties(ln=LineProperties(noFill=True))
+            ch.plot_area.graphicalProperties = GraphicalProperties(ln=line(ax.spines["left"]))
+            ys = min(nights.min().min(), stays[["recorded_price", "implied_bar"]].min().min())
+            xs = min(nights.index.min(), stays["arrival"].min())
+            scale(ch.x_axis, ax, np.array(ax.get_xlim()) - offset, ax.get_xticks() - offset,
+                  mdates.date2num(xs) - offset, months=True)
+            scale(ch.y_axis, ax, ax.get_ylim(), ax.get_yticks(), ys)
+            ch.x_axis.number_format = "yyyy-mm"
+            if isinstance(ax.yaxis.get_major_formatter(), PercentFormatter):
+                ch.y_axis.number_format = '0"%"'
+
+            # Artists in plot order: 2 scatters (stays sheet), then 2 lines (nights sheet)
+            sc, ln = ax.collections, ax.lines
+            cols = {sc[0]: (5, 6, len(stays)), sc[1]: (5, 7, len(stays)),
+                    ln[0]: (1, 3, len(nights)), ln[1]: (1, 2, len(nights))}
+            # Excel fills its legend row by row, matplotlib column by column
+            for art in (sc[0], ln[0], sc[1], ln[1]):
+                x, y, rows = cols[art]
+                ser = Series(Reference(ws, min_col=y, min_row=2, max_row=rows + 1),
+                             Reference(ws, min_col=x, min_row=2, max_row=rows + 1), title=art.get_label())
+                ser.smooth = False
+                if art in ln:
+                    ser.marker.symbol = "none"
+                    ser.graphicalProperties.line = line(art)
+                else:
+                    # matplotlib's dot: area s (pt²) plus an edge in the same colour
+                    size = np.sqrt(art.get_sizes()[0]) + art.get_linewidths()[0]
+                    ser.marker.symbol, ser.marker.size = "circle", max(2, round(size))
+                    ser.marker.graphicalProperties = GraphicalProperties(
+                        solidFill=colour(art.get_facecolor()[0]), ln=LineProperties(noFill=True))
+                    ser.graphicalProperties.line.noFill = True
+                ch.series.append(ser)
+
+            leg = ax.get_legend()
+            frame = leg.get_frame()
+            ch.legend.overlay = True
+            # Excel needs a little more room than matplotlib for 2 entries per row
+            ch.legend.layout = place(extent(leg).expanded(1.25, 1.1), i)
+            ch.legend.txPr = rich(leg.get_texts()[0].get_fontsize())
+            ch.legend.spPr = GraphicalProperties(solidFill=colour(frame.get_facecolor()), ln=line(frame))
+
+            ch.anchor = AbsoluteAnchor(pos=XDRPoint2D(0, round(i * h / n * emu_in)),
+                                       ext=XDRPositiveSize2D(round(cw * emu_in), round(h / n * emu_in)))
+            charts.add_chart(ch)
+
+    # openpyxl can't write colour transparency or custom dashes: add them to
+    # the chart XML (matplotlib dashes, like Excel's, scale with the line width)
+    on, off = plt.rcParams["lines.dashed_pattern"]
+    swap = {f'<a:srgbClr val="{c}" />': f'<a:srgbClr val="{c}"><a:alpha val="{round(a * 1e5)}" /></a:srgbClr>'
+            for c, a in alphas.items()}
+    swap['<a:prstDash val="dash" />'] = f'<a:custDash><a:ds d="{round(on * 1e5)}" sp="{round(off * 1e5)}" /></a:custDash>'
+    with zipfile.ZipFile(path) as z:
+        files = {f: z.read(f) for f in z.namelist()}
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for f, data in files.items():
+            if f.startswith("xl/charts/"):
+                for old, new in swap.items():
+                    data = data.replace(old.encode(), new.encode())
+            z.writestr(f, data)
+
+
 def plot(df, daily, path=PLOT_OUT, pct=False):
-    """Prices in EUR, or (pct) in % of the season's reference price p_ref."""
+    """Prices in EUR, or (pct) in % of the season's reference price p_ref.
+    The same plot also goes to an .xlsx of the same name as Excel charts."""
     fig, axes = plt.subplots(len(SEASONS), 1, figsize=(12, 3.8 * len(SEASONS)))
+    panels = []
     for ax, s in zip(np.atleast_1d(axes), SEASONS):
         d = daily[daily["season"] == s]
         b = df[(df["season"] == s) & (df["nights"] == 1)]
         ref = p_ref(df, daily, s)
         k = 100 / ref if pct else 1
+        rec = recorded_price(df[df["season"] == s], d.index)
         ax.scatter(b["arrival"], b["price"] * k, s=8, color="#bbb", label="Recorded price (1-night stays)")
         ax.scatter(b["arrival"], b["bar"] * k, s=8, color="#2E75B6", alpha=0.6, label="Implied BAR (1-night stays)")
-        ax.plot(d.index, recorded_price(df[df["season"] == s], d.index) * k, color="#888", lw=1.2,
+        ax.plot(d.index, rec * k, color="#888", lw=1.2,
                 ls="--", label="Old hotel price (recorded, 7-day median)")
         ax.plot(d.index, d["bar"] * k, color="#C0392B", lw=1.4, label="Daily BAR (double)")
         if pct:
@@ -472,8 +650,12 @@ def plot(df, daily, path=PLOT_OUT, pct=False):
             ax.set_ylabel("EUR / night")
         ax.grid(alpha=0.3)
         ax.legend(fontsize=8, loc="lower center", ncol=2)
+        panels.append((ax, s, pd.DataFrame({"daily_bar": d["bar"] * k, "old_price_7d": rec * k}),
+                       pd.DataFrame({"arrival": b["arrival"], "recorded_price": b["price"] * k,
+                                     "implied_bar": b["bar"] * k}).sort_values("arrival")))
     plt.tight_layout()
     plt.savefig(path, dpi=150)
+    excel_plot(fig, panels, path.replace(".png", ".xlsx"))
     plt.close(fig)
 
 
@@ -482,6 +664,7 @@ def plot(df, daily, path=PLOT_OUT, pct=False):
 # =============================================================================
 
 if __name__ == "__main__":
+    os.makedirs(BAR_DIR, exist_ok=True)
     bk, export_date = load_raw()
     base = prepare(bk)
     rules, occ = load_rules(), load_occupancy()
@@ -499,6 +682,8 @@ if __name__ == "__main__":
     money = dict.fromkeys(["price", "factor", "occ_price", "bar", "bar_ref"], 4)
     df.assign(ID=df["ID"].astype("int64"))[cols].round(money).to_csv(BOOKINGS_OUT, index=False)
     daily.to_csv(DAILY_OUT)
+    with open(INPUTS_OUT, "w", encoding="utf-8") as f:
+        f.writelines(f"{file_hash(p)}  {p}\n" for p in (XLSX_PATH, RULES_PATH, OCCUPANCY_PATH))
     text = report(df, daily, ladders, rules, occ, hits)
     with open(REPORT_OUT, "w", encoding="utf-8") as f:
         f.write(text + "\n")
@@ -506,5 +691,5 @@ if __name__ == "__main__":
     plot(df, daily, PLOT_PCT_OUT, pct=True)
 
     print(text)
-    print(f"\n  Saved: {BOOKINGS_OUT}, {DAILY_OUT}, {REPORT_OUT}, {PLOT_OUT}, {PLOT_PCT_OUT}")
+    print(f"\n  Saved: {BOOKINGS_OUT}, {DAILY_OUT}, {INPUTS_OUT}, {REPORT_OUT}, {PLOT_OUT}, {PLOT_PCT_OUT} (+ .xlsx charts)")
     print("  Next: python ml_demand_model.py")

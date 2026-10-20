@@ -5,10 +5,7 @@ BOOKINGS.*
 hotel_pms_data.*
 avl-status*
 kaggle_data.*
-bar_bookings.csv
-bar_daily.csv
-bar_validation.txt
-bar_daily*.png
+bar_exports/
 *.pkl
 ml_comparison.csv
 ml_cv_grid.csv
