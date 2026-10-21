@@ -18,7 +18,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.results_plotter import load_results, ts2xy
 
-from hotel_season_env import HotelEnv, PRICE_MULTIPLIERS
+from hotel_season_env import HotelEnv, PRICE_MULTIPLIERS, SIM_DATA_PATH
 
 
 # =============================================================================
@@ -108,7 +108,7 @@ ALGOS = {
 RL_COLOURS = ["#2E75B6", "#8E44AD", "#16A085", "#7F8C8D"]   # by position in --algos
 
 SENSITIVITY_ELASTICITIES = [0.6, 0.8, 1.0, 1.2, 1.5]
-SENSITIVITY_N_EVAL       = 100     # test seasons per policy (same for hotel and fixed)
+SENSITIVITY_N_EVAL       = N_TEST  # all test seasons: the eps = 1.0 row equals the main result
 
 ELASTICITY_LOG = "elasticity_log_{model}.csv"   # one row appended per run
 PROTOCOL       = "val-test"                     # logged: rows of older runs used one season set
@@ -196,9 +196,12 @@ def find_best_fixed(env, n=N_VAL_FIXED, seed0=VAL_SEED0):
 def append_elasticity_log(model_name, args, table, suffix, best_multiplier):
     """Append this run's hotel and best fixed revenue and the mean RL revenue
     and occupancy to the model's log, to track how they change with the
-    elasticity across runs."""
+    elasticity across runs. sim_data identifies the world: rows with the same
+    one come from the same sim_data.pkl (every ML rerun gives a new one)."""
+    from ml_demand_model import file_hash         # here: workers don't load the ML stack
     row = {"timestamp": datetime.now().isoformat(timespec="seconds"),
            "protocol": PROTOCOL,
+           "sim_data": file_hash(SIM_DATA_PATH)[:12],
            "season": args.season, "elasticity": args.elasticity,
            "timesteps": args.timesteps, "seeds": " ".join(map(str, args.seeds)),
            "hotel_revenue": table["revenue"].iloc[0],           # rows 0-1: hotel, best fixed
@@ -260,6 +263,7 @@ def train_agent(algo, seed, log_dir, save_path, env_kwargs, timesteps, eval_ever
     model = cls("MlpPolicy", venv, seed=seed, verbose=0, device="cpu", **params)
     val = ValidationCheckpoint(env_kwargs, save_path, eval_every)
     model.learn(total_timesteps=timesteps, callback=val)
+    venv.close()                                    # closes the Monitor's monitor.csv
     return cls.load(save_path, device="cpu"), val
 
 

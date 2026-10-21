@@ -2,6 +2,7 @@ import numpy as np
 import joblib
 import gymnasium as gym
 from gymnasium import spaces
+from scipy.special import gammaincinv
 
 
 SIM_DATA_PATH = "sim_data.pkl"
@@ -101,9 +102,11 @@ class HotelEnv(gym.Env):
         self.t = 0
         self.committed = np.zeros(self.n_days + 40, dtype=int)
         self.committed[:self.n_days] = self.offline          # the real offline stays
-        # The whole season's randomness, fixed before any price is set
-        self.shock = (rng.gamma(self.k, 1.0 / self.k, size=self.n_days)
-                      if self.k else np.ones(self.n_days))
+        # The whole season's randomness, fixed before any price is set. Inverse-CDF
+        # gamma shocks: a fixed number of draws, so a seed gives the same season
+        # for any k (and any world), and its shocks change smoothly with k
+        u_shock = rng.random(self.n_days)
+        self.shock = gammaincinv(self.k, u_shock) / self.k if self.k else np.ones(self.n_days)
         self.u_count = rng.random(self.n_days)
         self.u_pick = rng.random((self.n_days, MAX_REQUESTS))
         return self._obs(), {}
@@ -121,12 +124,15 @@ class HotelEnv(gym.Env):
         picks = (self.u_pick[t, :n_requests] * len(pool["rooms"])).astype(int)
 
         revenue, room_nights, accepted, cancelled, lost = 0.0, 0, 0, 0, 0
+        recorded = 0         # rooms the booking data would hold: requests whose stay fitted
         for i in picks:
+            rooms, nights = pool["rooms"][i], pool["nights"][i]
+            fits = self.committed[t:t + nights].max() + rooms <= self.capacity
             if pool["cancelled"][i]:
                 cancelled += 1
+                recorded += rooms * fits
                 continue
-            rooms, nights = pool["rooms"][i], pool["nights"][i]
-            if self.committed[t:t + nights].max() + rooms > self.capacity:
+            if not fits:
                 lost += 1
                 continue
             self.committed[t:t + nights] += rooms
@@ -134,10 +140,11 @@ class HotelEnv(gym.Env):
             revenue += pool["total"][i] * price / pool["orig_price"][i]
             room_nights += rooms * nights
             accepted += 1
+            recorded += rooms
 
         reward = revenue - self.variable_cost * room_nights
         info = dict(date=self.dates[t], price=float(price), requests=int(n_requests),
-                    accepted=accepted, cancelled=cancelled, lost=lost,
+                    accepted=accepted, cancelled=cancelled, lost=lost, recorded=int(recorded),
                     revenue=revenue, room_nights=room_nights,
                     occupied=int(self.committed[t]))
         self.t += 1

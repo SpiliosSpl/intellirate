@@ -81,13 +81,14 @@ MIN_TEST_DAYS = 100                  # uncensored test days required
 # Realism checks on the world before calibration (flagged, not fatal)
 WORLD_MIN_SPEARMAN = 0.5             # daily world vs actual requests
 WORLD_MONTH_RANGE  = (0.8, 1.25)     # monthly world / actual requests
-WORLD_VAR_TOL      = 0.01            # world vs real daily variance (fatal)
 
 MIN_PROFILES_PER_MONTH = 20          # else fall back to the whole season
 
-CALIB_SEASONS = 50                   # simulated seasons per calibration round
+CALIB_SEASONS = 200                  # simulated seasons per calibration round
 CALIB_SEED0   = 200_000              # never used by training or evaluation
-CALIB_TOL     = 0.005                # simulated vs real room-nights
+CALIB_ROUNDS  = 20                   # per target, else the calibration fails
+CALIB_TOL     = 0.005                # simulated vs real room-nights (G4)
+WORLD_VAR_TOL = 0.01                 # simulated vs real daily variance of recorded requests (G3)
 
 
 def make_model(name, cfg):
@@ -483,10 +484,10 @@ def train_models(daily):
         model = make_model(name, WORLD_PARAMS[name]).fit(X, y)
         fit = model.predict(X)
         # Shocks for the simulated world: the world's pattern is the in-sample
-        # fit, which already holds part of the data's luck. Choose k so that the
-        # world's total variance equals the real one, on the fit after the
-        # per-season rescale that build_sim_data applies:
-        # Var(y) = E[fit] + Var(fit) + E[fit^2] / k
+        # fit, which already holds part of the data's luck. Starting value of k
+        # for calibrate_to_availability, which re-fits it: the world's total
+        # variance equals the real one, on the fit after the per-season rescale
+        # that build_sim_data applies: Var(y) = E[fit] + Var(fit) + E[fit^2] / k
         k_world = {}
         for season in SEASONS:                      # one k per season
             m = (daily["season"] == season).values
@@ -541,16 +542,6 @@ def build_sim_data(bk, daily, results):
             mask = daily["season"] == season
             daily.loc[mask, f"true_{name}"] *= (daily.loc[mask, "requests"].sum()
                                                 / daily.loc[mask, f"true_{name}"].sum())
-            # Guardrail G3: the world's daily variance (fit + Poisson + gamma
-            # shocks) must equal the real one for the rescaled fit it will drive
-            f, y = daily.loc[mask, f"true_{name}"].values, daily.loc[mask, "requests"].values
-            k = r["k_world"][season]
-            ratio = (f.mean() + f.var() + ((f ** 2).mean() / k if k else 0)) / y.var()
-            if k and abs(ratio - 1) > WORLD_VAR_TOL:
-                raise RuntimeError(f"World {name} {season}: variance {ratio:.3f} x real")
-            if not k:
-                print(f"  World {name} {season}: Poisson only (the fit carries the real variance), "
-                      f"variance {ratio:.2f} x real")
 
     seasons = {}
     for season in SEASONS:
@@ -583,6 +574,8 @@ def build_sim_data(bk, daily, results):
             "profiles":        pools,
             "actual": {        # what really happened, for simulator validation
                 "requests":    int(d["requests"].sum()),
+                "requests_var": float(np.var(d["requests"])),   # daily, the G3 target
+                "sold_out_nights": int(d["censored"].sum()),
                 "confirmed":   int(len(ok)),          # bookings, as the env counts them
                 "room_nights": int(ok["room_nights"].sum()),
                 "revenue":     float(ok["Total"].sum()),
@@ -591,35 +584,74 @@ def build_sim_data(bk, daily, results):
     return {"seasons": seasons, "models": MODEL_NAMES}
 
 
-def calibrate_to_availability(sim):
-    """Rescale each world's demand so that the simulator, at the hotel's own
-    prices and under the real online availability, sells the real number of
-    room-nights. Demand on nights closed online was never recorded, so the
-    season-total scaling alone under-books. At the hotel's price the price
-    response cancels, so the factor does not depend on the elasticity.
-    Returns {(season, model): (factor, simulated / real - 1)}. Fails if the
-    simulator cannot be brought within CALIB_TOL (guardrail G4)."""
+def simulate_hotel(sim, season, name):
+    """The simulator at the hotel's prices on the calibration seasons, per
+    season on average: room-nights sold, recorded requests (accepted, and
+    cancelled whose stay fitted: what the booking data would hold) and their
+    daily variance, and sold-out nights."""
     from hotel_season_env import HotelEnv      # the env reads sim_data: import here
+    env = HotelEnv(season, name, sim=sim)
+    rn, rec, var, full = 0, 0, 0.0, 0
+    for i in range(CALIB_SEASONS):
+        env.reset(seed=CALIB_SEED0 + i)
+        day = np.empty(env.n_days)
+        for t in range(env.n_days):
+            info = env.step_price(env.hotel_price[t])[4]
+            rn += info["room_nights"]
+            day[t] = info["recorded"]
+        rec, var = rec + day.sum(), var + day.var()
+        full += (env.committed[:env.n_days] >= env.capacity).sum()
+    n = CALIB_SEASONS
+    return dict(room_nights=rn / n, recorded=rec / n, recorded_var=var / n, sold_out=full / n)
+
+
+def calibrate_to_availability(sim):
+    """Fit each world to the real season as the simulator records it: at the
+    hotel's own prices and under the real online availability.
+    - One demand factor, so that it sells the real room-nights (guardrail G4).
+      Demand on nights closed online was never recorded, so the season-total
+      scaling alone under-books.
+    - dispersion_k, so that the daily variance of the recorded requests equals
+      the real one (guardrail G3): the world the agents train in, compared like
+      with like. If even pure Poisson is more volatile, k is None (flagged).
+    At the hotel's price the price response cancels, so neither depends on the
+    elasticity. Fails if a target is not met within CALIB_ROUNDS.
+    Returns {(season, model): factor, k before and after, simulated vs real}."""
     out = {}
     for season, s in sim["seasons"].items():
+        real = s["actual"]
         for name in s["lambda_true"]:
-            factor = 1.0
-            for _ in range(10):
-                env = HotelEnv(season, name, sim=sim)
-                sold = 0
-                for i in range(CALIB_SEASONS):
-                    env.reset(seed=CALIB_SEED0 + i)
-                    for t in range(env.n_days):
-                        sold += env.step_price(env.hotel_price[t])[4]["room_nights"]
-                ratio = s["actual"]["room_nights"] / (sold / CALIB_SEASONS)
-                if abs(ratio - 1) < CALIB_TOL:
+            k0 = s["dispersion_k"][name]
+            theta = 1 / k0 if k0 else 0.0                 # 1/k; 0 is Poisson
+            slope = np.mean(s["lambda_true"][name] ** 2) / real["requests_var"]   # first guess
+            factor, last = 1.0, None
+            for _ in range(CALIB_ROUNDS):                 # k: secant steps on theta (G3)
+                s["dispersion_k"][name] = 1 / theta if theta > 0 else None
+                for _ in range(CALIB_ROUNDS):             # demand factor at this k (G4)
+                    r = simulate_hotel(sim, season, name)
+                    ratio = real["room_nights"] / r["room_nights"]
+                    if abs(ratio - 1) < CALIB_TOL:
+                        break
+                    s["lambda_true"][name] = s["lambda_true"][name] * ratio
+                    factor *= ratio
+                else:
+                    raise RuntimeError(f"Calibration of {name} {season} did not converge "
+                                       f"(simulated / real room-nights {1 / ratio:.3f})")
+                gap = r["recorded_var"] / real["requests_var"] - 1
+                floor = theta == 0 and gap > 0           # less variance is impossible
+                if abs(gap) < WORLD_VAR_TOL or floor:
                     break
-                s["lambda_true"][name] = s["lambda_true"][name] * ratio
-                factor *= ratio
+                if last and theta != last[0] and (gap - last[1]) / (theta - last[0]) > 0:
+                    slope = (gap - last[1]) / (theta - last[0])
+                last = (theta, gap)
+                theta = max(theta - gap / slope, 0.0)
             else:
-                raise RuntimeError(f"Calibration of {name} {season} did not converge "
-                                   f"(simulated / real room-nights {1 / ratio:.3f})")
-            out[season, name] = (factor, 1 / ratio - 1)
+                raise RuntimeError(f"World {name} {season}: recorded-request variance "
+                                   f"{1 + gap:.3f} x real after calibration")
+            out[season, name] = dict(factor=factor, k0=k0, k=s["dispersion_k"][name],
+                                     room_nights=1 / ratio - 1, var=1 + gap, floor=floor,
+                                     recorded=r["recorded"] / real["requests"],
+                                     sold_out=r["sold_out"])
     return out
 
 # ==================plotting====================
@@ -686,9 +718,15 @@ if __name__ == "__main__":
               f"{(s['capacity'] - a).sum()} offline room-nights; "
               f"real online sales above it on {(sold > a).sum()} nights")
         for name in s["lambda_true"]:
-            f, err = calib[season, name]
-            print(f"    {name}: demand x {f:.3f} so the simulator sells the real season "
-                  f"(hotel prices: {err:+.1%} room-nights)")
+            c = calib[season, name]
+            k0, k = ("Poisson" if v is None else f"{v:.2f}" for v in (c["k0"], c["k"]))
+            print(f"    {name}: demand x {c['factor']:.3f}, k {k0} -> {k}; at the "
+                  f"hotel's prices: room-nights {c['room_nights']:+.1%}, recorded requests "
+                  f"{c['recorded']:.3f} x real, their daily variance {c['var']:.3f} x real, "
+                  f"sold-out nights {c['sold_out']:.1f} (real {s['actual']['sold_out_nights']})")
+            if c["floor"]:
+                print(f"    !!! {name} {season}: even pure Poisson is more volatile than "
+                      f"the real season (variance {c['var']:.3f} x real)")
     print()
 
     joblib.dump({"world": {n: r["model"] for n, r in results.items()},
