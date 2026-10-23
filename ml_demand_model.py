@@ -386,9 +386,11 @@ def test_scores(y, p, k=None):
     return out
 
 
-def deviance_gain(y, p, base, groups, rng):
+def deviance_gain(y, p, base, groups):
     """Baseline deviance minus model deviance (positive: model better), with a
-    95% CI from resampling whole ISO weeks."""
+    95% CI from resampling whole ISO weeks. Every call draws the same weeks,
+    so the CIs are paired between models and don't depend on the call order."""
+    rng = np.random.default_rng(BOOT_SEED)
     diff = poisson_dev(y, base) - poisson_dev(y, p)
     weeks = [np.where(groups == w)[0] for w in np.unique(groups)]
     draws = [diff[np.concatenate([weeks[i] for i in rng.integers(len(weeks), size=len(weeks))])].mean()
@@ -428,7 +430,6 @@ def train_models(daily):
     if scored.sum() < MIN_TEST_DAYS:                              # guardrail G2
         raise RuntimeError(f"Only {scored.sum()} uncensored test days (< {MIN_TEST_DAYS})")
     groups = week_groups(daily.index[scored])
-    rng = np.random.default_rng(BOOT_SEED)
     # Seasonal naive baseline: the TUNE_SEASON mean of the same month
     month_mean = daily[tune].groupby("month")["requests"].mean()
     base = daily["month"].map(month_mean).values
@@ -457,7 +458,7 @@ def train_models(daily):
         forecaster = make_model(name, cfg).fit(X[tune], y[tune])
         pred_test = forecaster.predict(X[test])
         p = pred_test[scored[test]]
-        gain, lo, hi = deviance_gain(y[scored], p, base[scored], groups, rng)
+        gain, lo, hi = deviance_gain(y[scored], p, base[scored], groups)
         table.append({"evaluation": f"test_{TEST_SEASON}", "model": MODEL_NAMES[name],
                       "config": str(cfg), "cv_deviance": chosen["cv"], "cv_se": chosen["se"],
                       **test_scores(y[scored], p, k),
@@ -478,7 +479,7 @@ def train_models(daily):
         table.append({"evaluation": "pooled_cv_reference", "model": MODEL_NAMES[name],
                       "config": str(WORLD_PARAMS[name]), **test_scores(y[scored], pooled[scored]),
                       **dict(zip(("gain_vs_baseline", "gain_lo", "gain_hi"),
-                                 deviance_gain(y[scored], pooled[scored], base[scored], groups, rng)))})
+                                 deviance_gain(y[scored], pooled[scored], base[scored], groups)))})
 
         # 3. World: a description of the real seasons, fitted on all of them
         model = make_model(name, WORLD_PARAMS[name]).fit(X, y)

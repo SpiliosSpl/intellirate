@@ -80,11 +80,12 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    - Each request samples a real booking profile. Cancelled profiles give no revenue, and profiles that don't fit under `capacity` over their nights are lost. `info["recorded"]` counts what the booking data would hold: the rooms of accepted requests plus cancelled requests whose stay would have fitted (`cancelled` and `lost` count cancelled requests whether they fit or not). Capacity is the season's physical STD rooms, stored per season in `sim_data.pkl` (`CAPACITY` in `ml_demand_model.py`, the length of `STD_ROOMS`): 18 in 2025 (including room 108) and 17 in 2026 (room 108 was renovated and is no longer STD). `reset()` pre-fills `committed` with the real offline stays (`capacity − online_avail`), so online sales are limited to the real online availability. The offline calendar is the same in every episode; only online demand is random. Revenue is the profile's real `Total` scaled by `price / orig_price`.
    - The observation has 9 dims in [-1, 1]: forecast, committed rooms today and tomorrow (offline stays included), cyclic month and day of week, holiday flag, and season progress.
    - `HotelEnv(..., sim=dict)` takes the sim data directly; the calibration uses this.
-   - Baselines use `step_price(price)` to pass an arbitrary price, for example the hotel's BAR.
+   - Baselines use `step_price(price)` to pass an arbitrary price, for example the hotel's BAR. `dry_run(price)` returns the reward date `t` would earn at a price, from the same pre-drawn randomness and calendar, without booking anything (the training baseline in `rl_agent.py`).
    - **The env is the project's MDP** (the code never names it). The state is the day `t` plus the `committed` calendar, the action is the multiplier, the reward is revenue minus variable cost, the horizon is finite (one season) and γ = 0.9 is set in `rl_agent.py` (see the RL hyperparameter finding). Strictly it is a POMDP: the observation shows committed rooms only for tonight and tomorrow, so longer stays are partly hidden. With a mean stay of 1.26 nights, today's price barely affects later states, so the problem is close to a contextual bandit.
 
 3. **[rl_agent.py](rl_agent.py)** runs one pipeline per ML model, and each pipeline trains every RL algorithm:
    - RL algorithms live in the `ALGOS` registry (`key -> (SB3 class, params, display name)`). `train_agent` is generic: SB3, CPU, `VecNormalize` on reward only, which is also valid for Double DQN because off-policy SB3 normalises replay-buffer rewards at sample time. To add an algorithm, add a registry entry.
+   - **Training reward (`BASELINE_REWARD`, on for both algorithms since 22 Oct):** `BaselineReward` trains on revenue minus the best fixed price's `dry_run` revenue on the same day. The demand noise both share cancels (the day-by-day signal is about 5 € against a 399 € daily SD), and the subtracted term doesn't depend on today's action; only multi-night stays add a small bias. `Monitor` sits inside the wrapper, so `monitor.csv` and the learning curves keep the true revenue. Validation and test always use plain revenue.
    - Double DQN (`"ddqn"`, which replaced DQN) is `DoubleDQN(DQN)`. SB3 has no Double DQN, so it overrides `train()`, copied from SB3 2.8.0's `DQN.train` (re-check it after an SB3 upgrade). Only the next-state value changes (`next_q_values`): the online net selects the action and the target net evaluates it. The Experiment findings section has the comparison with DQN, made with identical `DQN_PARAMS`; those have since been tuned.
    - It validates the simulator: the hotel's prices in the sim are compared with the real season. Occupancy and RevPAR in `results.csv` are over the online available room-nights.
    - **Train / validation / test (protocol `val-test`).** All three are simulated seasons of the same world, told apart by seed:
@@ -92,12 +93,20 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
      - **Validation:** seeds from `VAL_SEED0 = 100000`, the old evaluation seasons, which past design choices already used. It chooses things and is never reported as a result:
        - `ValidationCheckpoint` runs the greedy policy on the first `N_VAL = 50` seasons every `--eval-every` steps (default `EVAL_EVERY = 25_000`) and at the end of training. It saves the best checkpoint as `<algo>_seed<n>.zip`, and that checkpoint is the one tested, not the final one.
        - The best fixed price is chosen on `N_VAL_FIXED = 200` validation seasons (no training, so more seasons are cheap; 50 sometimes missed a near-tie).
+       - The per-date schedule is chosen on `N_VAL_SCHEDULE = 1000` validation seasons. The seed ensemble is compared with the mean of seeds on seasons from `ENSEMBLE_SEED0 = 100050` (`N_ENSEMBLE_VAL = 200`), which checkpoint selection never used.
      - **Test:** `N_TEST = 200` seasons from `TEST_SEED0 = 500000`, shared by every policy (common random numbers). Every reported number comes from them, including the simulator check. Never choose anything on them: design choices use validation only, and the test is looked at once.
-     - The callback has its own env, and a deterministic `predict` draws no random numbers, so training is identical to a run without it (checked: identical `monitor.csv` for all 12 agents).
+     - The callback has its own envs, and a deterministic `predict` draws no random numbers, so training is identical to a run without it (checked: identical `monitor.csv` for all 12 agents).
+     - Agents are evaluated with `run_batched`: the seasons in lockstep, one batched `predict` per day, 3–5× faster than one season at a time. Results are the same up to float rounding, which can flip a near-exact tie between two actions (seen once: a 10k-step validation point moved by 4 €).
    - It finds the best fixed price once per ML model, then trains each algorithm for each seed.
    - It reports the gain over the hotel split into a price-*level* effect (best fixed vs hotel, driven by the elasticity assumption) and a *day-by-day* effect per algorithm (RL vs best fixed). A negative day-by-day number means the agent hasn't converged.
+   - **Benchmarks** (no training; chosen on validation, reported on test):
+     - the per-date schedule (`action_sweep` → `best_schedule`: the best level per date). It is a benchmark, not a ceiling: a policy that sees the rooms left can beat it.
+     - the best fixed price and the per-date schedule within the hotel's own price range (`observed_range`: 0.95–1.10× in both seasons), where `g(p)` is not extrapolated.
+
+     Every row has `above_range_%`, the share of days priced above the hotel's highest price. The comparison adds `schedule_vs_best_fixed_%` and `best_fixed_in_range_vs_hotel_%`.
+   - **Seed ensemble** (an odd number of seeds, at least 3): the median of the seeds' greedy actions each day, as an extra row per algorithm, plus the comparison columns `ensemble_vs_best_fixed_%` and `ensemble_beats_seeds_on_val`. Adopt it only if it beats the mean of seeds on validation; the `rl_*` columns stay mean-of-seeds.
    - **Error bars:** each seed row has the paired SE over the test seasons. The mean-of-seeds rows and the `comparison` columns `rl_vs_hotel_se_%` / `rl_vs_best_fixed_se_%` combine the variance between training seeds with the season noise (`seed_se`: `sqrt(Var_seeds/n + season_se²)`). The `*_ci95_%` columns use t(n−1), so few seeds give wide CIs (t = 2.78 at the default 5, 4.30 at 3). Report the mean of all seeds, never the best one. More seeds need no code change (`--seeds ... --jobs n` on a machine with enough cores).
-   - It also sweeps elasticity for the best fixed price, with no training: chosen on validation, reported against the hotel on all `N_TEST` test seasons (`SENSITIVITY_N_EVAL`), so its ε = 1.0 row equals the main result.
+   - It also sweeps elasticity for the best fixed price, with no training: chosen on validation, reported against the hotel on all `N_TEST` test seasons (`SENSITIVITY_N_EVAL`), so its ε = 1.0 row equals the main result. A best fixed price at the edge of the grid (0.75 or 1.25×; 1.25× at ε ≤ 0.8) is flagged `!!!` here and in the main result. The grid is not widened: 1.25× already lies 13% above the hotel's highest price.
    - Per ML model it writes `results_*/` containing:
      - `results.csv` (test numbers; seed rows add `checkpoint_step`, `val_reward`, `val_vs_hotel_%`);
      - `validation_curve.csv`;
@@ -107,7 +116,7 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
      - `<algo>_seed<n>.zip` (the selected checkpoint).
 
      `comparison_<tag>.csv/.png` gets one row per ML × RL combination, with `rl_*` columns.
-   - Every run appends one row per ML model to `elasticity_log_<model>.csv` (`append_elasticity_log`). Each row has the timestamp, the `protocol` (`val-test`), `sim_data` (the first 12 hex digits of `sim_data.pkl`'s SHA-256: rows with the same value come from the same world, and every ML rerun gives a new one, since rf refits differ by about 1e-16), season, elasticity, timesteps and seeds, the hotel revenue, the best fixed multiplier and its revenue, plus each algorithm's mean-of-seeds revenue and occupancy, all taken from `results.csv`. It tracks results across runs at different `--elasticity` values. A rerun adds a row instead of replacing one, and a skipped algorithm leaves its columns empty. If the log's columns no longer match, the run fails instead of appending: after a column change, rename the old logs (`_pre-valtest`, `_pre-simdata`). Runs in the repo append to it too, which is another reason to keep smoke runs in a scratch copy.
+   - Every run appends one row per ML model to `elasticity_log_<model>.csv` (`append_elasticity_log`). Each row has the timestamp, the `protocol` (`val-test`), `sim_data` (the first 12 hex digits of `sim_data.pkl`'s SHA-256: rows with the same value come from the same world, and every ML rerun gives a new one, since rf refits differ by about 1e-16), season, elasticity, timesteps and seeds, the hotel revenue, the best fixed multiplier and its revenue, plus each algorithm's mean-of-seeds revenue and occupancy, all taken from `results.csv`. It tracks results across runs at different `--elasticity` values. A rerun adds a row instead of replacing one, and a skipped algorithm leaves its columns empty. If an existing log's columns don't match `log_columns()`, the run fails at the start, before any training: after a column change, rename the old logs (`_pre-valtest`, `_pre-simdata`). Runs in the repo append to it too, which is another reason to keep smoke runs in a scratch copy.
 
 ## Booking data and rates
 
@@ -260,8 +269,7 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
   - **Data alignment (fixed, next item):** 2026 ran past the PMS's last arrival (16 Oct opened all 17 rooms online), PMS gaps were clipped silently, and room 108's 2026 stays and double-entered room-nights pushed the PMS above capacity.
   - **Latent code issues (no effect on current results):**
     - Fixed (next item): `load_rules`' `.replace("", None)` (pandas ≤ 2.x would forward-fill booking-date windows), a silent `""` occupancy class (NaN BAR), and `load_bar` not noticing edited rate CSVs.
-    - The "Best combination" line in `rl_agent.py` picks the maximum on the test seasons, against the protocol.
-    - `deviance_gain` shares one `rng` across models, so its CIs aren't paired between models and depend on call order. `rl_seed_spread_%` uses `ddof=0`, unlike every other SE.
+    - Fixed 22 Oct (RL results unchanged): the "Best combination" line (a maximum on the test seasons) is removed; `deviance_gain` draws a fresh generator per call, so its CIs are paired between models and independent of call order (the rf pooled and both xgb CIs moved by ≤ 0.03); `rl_seed_spread_%` uses `ddof=1`, like every other SE.
   - **Verified correct:**
     - `DoubleDQN.train` matches SB3 2.8.0's `DQN.train` line for line, apart from the target.
     - A deterministic `predict` draws no random numbers (DQN skips `np.random.rand()`).
@@ -384,6 +392,35 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
     - Agents trained in either world score the same in both: PPO new − old ≤ 0.02 ± 0.12, and the old PPO agents beat best fixed in the new world by +0.33 / +0.27%.
   - Absolute revenue is 0.3–0.5% higher in the new world for every policy, because it loses fewer requests; pricing is no better.
   - **The RL fixes change nothing else:** with the same world, results, validation curves, episodes and weights are identical with and without them; only `sensitivity.csv` and the log column differ.
+- **Full run, 900k × 5 seeds, G3 world (21 Oct, plain revenue reward; the next full run overwrites its `results_2026_*_e1.0`):**
+  - Best fixed 1.15× in both worlds: +1.50% (rf) / +1.64% (xgb) vs hotel.
+  - PPO: +1.99 / +2.16% vs hotel, +0.48 ± 0.08 / +0.51 ± 0.08% vs best fixed.
+  - Double DQN: +1.32 / +1.56% vs hotel, −0.18 / −0.08% vs best fixed.
+  - **Budget: keep 900k.** 6 of 10 PPO seeds chose a checkpoint at ≥ 700k steps (2 at the last one), Double DQN at 125k–725k. The validation mean over 600–900k is 250–310 € above that over 150–300k.
+- **Benchmarks, CRN reward, batched evaluation and seed ensemble (22 Oct; scratch tests, applied):**
+  - **Benchmarks** (no training; test, vs hotel, rf / xgb):
+
+    | Policy | rf / xgb |
+    |---|---|
+    | Best fixed (1.15×) | +1.50 / +1.64% |
+    | Best fixed in the hotel's range (1.10×) | +1.34 / +1.44% |
+    | Per-date schedule | +2.16 / +2.28% |
+    | Per-date schedule in the hotel's range | +1.35 / +1.33% |
+
+    - About 90% of the level gain holds without any price above the hotel's highest one.
+    - **All the day-by-day value needs prices above the hotel's range.** Inside it, the per-date schedule gains nothing over 1.10× fixed. The full schedule (+0.65 / +0.63% over best fixed) prices above the range on about a third of days. Report `above_range_%` with every RL result.
+    - PPO's +0.48 / +0.51% (21 Oct) is about three quarters of the schedule's day-by-day value.
+  - **CRN training reward** (rf world, ε 1, 300k steps, tuning seeds 1001–1005, holdout seasons 400000–400199, % vs best fixed):
+
+    | | Revenue | Revenue − best fixed dry run | Difference |
+    |---|---|---|---|
+    | PPO | +0.15 ± 0.09 | +0.43 ± 0.08 | +0.28 ± 0.12 |
+    | Double DQN | −0.39 ± 0.14 | +0.23 ± 0.07 | +0.62 ± 0.16 |
+
+    - In both algorithms, every seed trained with the baseline beats every seed trained on revenue. Double DQN beats best fixed for the first time.
+    - Training is 1–4% slower. Adopted for both (`BASELINE_REWARD`). Results and elasticity-log rows from before 22 Oct used plain revenue.
+  - **Batched evaluation:** identical per-season results on the 200 test seasons for the 21 Oct seed-42 checkpoints, 2.6–4.8× faster.
+  - **Seed ensemble:** a median of two actions always takes the lower price, so it needs an odd number of seeds. Its value is known only after a full run.
 - **Elasticity:** keep 1.0 as the main scenario. Per the hotel, its main competitor is usually 5–15% cheaper for this room type (sometimes more expensive), so ε well below 1 would imply implausible premiums; report about 0.8–1.5 as sensitivity.
 
 Cross-file contracts: `bar_rates.py` imports `load_raw`, `file_hash`, `SEASONS`, `SUMMER`, `XLSX_PATH` and `BAR_DIR` from `ml_demand_model.py`, which in turn reads `bar_exports/bar_daily.csv` / `bar_bookings.csv` (`load_bar` fails loudly if they are missing, don't cover every booking, or `bar_inputs.sha256` no longer matches `BOOKINGS.xlsx` and the rate CSVs: re-run `bar_rates.py` after changing them or the load filters). `rl_agent.py` imports `PRICE_MULTIPLIERS` and `SIM_DATA_PATH` from the env, and `file_hash` from `ml_demand_model.py` inside `append_elasticity_log`, so worker processes don't load the ML stack. The env depends on the exact `sim_data.pkl` schema produced by `build_sim_data` (per season: `capacity`, `online_avail`, `dispersion_k`, `dates`, `lambda_true`, `lambda_forecast`, `hotel_price`, `p_ref`, calendar arrays, `profiles`, `actual`; top level: `seasons`, `models`). `actual` also holds the calibration targets `requests_var` and `sold_out_nights`. After changing that schema, `BOOKINGS.xlsx` or `hotel_pms_data.csv`, you must re-run `ml_demand_model.py`. `ml_demand_model.py` imports `HotelEnv` inside `simulate_hotel` to calibrate, and calibrates on the env's `info["recorded"]` and `info["room_nights"]`. Model keys `"rf"` / `"xgb"` are shared across the ML, env and RL files.
@@ -392,31 +429,21 @@ Cross-file contracts: `bar_rates.py` imports `load_raw`, `file_hash`, `SEASONS`,
 
 Nothing here is implemented. Importance: **P1** = needed before the final thesis run (correctness, realism or protocol); **P2** = likely to raise agent revenue or make the results more defensible; **P3** = if time allows; **Later** = beyond the thesis, described as a limitation. Effort: 1 (quick) … 5 (long). Test every item in a scratch copy, choose only on validation, tuning or holdout seasons (never test), and apply after approval. Items that change `online_avail` or the world need an ML + RL rerun, so do them together.
 
-**Order:** world and data fixes (one ML rerun) → RL code fixes → reward test → tuning → benchmarks and robustness → final full run → docs.
+**Order:** world and data fixes (one ML rerun) → tuning → robustness and the RL price-range run → final full run → docs.
 
 **World and data** (P1 unless marked):
 - **World calibration.** Choose the world by realism (recorded requests, their variance, room-nights, sold-out nights), never by RL revenue. Until it is settled, report the ε = 1 level gain as the range +0.9 to +3.1% with the reason (see the calibration findings).
   - **Per-date calibration (P2, 3–4):** the remaining realism gap of the applied one-factor world is about 42–43 sold-out nights against 32 real, 17 of them on nights that had rooms left. The prototype matches recorded requests per date and their variance. Its open issues are 46–50 sold-out nights (against 34 real before the PMS fix), room-nights 2.5–3.5% short, and a result that depends on the cap (+2.1 to +3.1%). Next: build it on the applied joint solver (uplift per date plus `k`), aiming at recorded variance and sold-out nights, then check whether the room-nights close.
   - **Censored likelihood (P3, 4):** an untested alternative. Scaling only censored nights doesn't work.
-- **Latent fix (P3, 1):** `deviance_gain` gets a fresh `default_rng(BOOT_SEED)` per call, so its CIs are paired between models.
 - **Env invariant checks (P3, 1–2):** a small check script: the same seed gives the same season, and demand is monotone in price.
 
 **RL code:**
-- **Batched evaluation (P1, 2):** step the seasons in lockstep, with one batched `predict` per day (bit-identical, 3–4× faster), in `ValidationCheckpoint`, the test runs and tuning.
-- **Protocol fixes (P1, 1):** remove the "Best combination" line (a maximum on test); compute `rl_seed_spread_%` with `ddof=1`.
 - **One process pool (P2, 1):** all ML × RL × seed jobs in one pool, about 25–35% less wall time.
-- **Small (P3, 1):**
-  - check the elasticity-log columns at the start of `main()` (today it fails only after all the training);
-  - a wider multiplier grid in the sensitivity sweep at ε ≤ 0.8.
 - **Diagnostics (P3, 1):** log in `ValidationCheckpoint` (TensorBoard) the validation gain, a histogram of the chosen multipliers, mean price / occupancy / lost requests and the price–forecast correlation, plus PPO's KL, entropy and explained variance.
 
-**Agent revenue** (the main aim): the per-date ceiling is about 0.75 points over best fixed (19 Oct world), and PPO gets about 0.3 points of it (G3 finding).
-- **Variance-reduced training reward (P2, 2):** train on `r(a) − r(best fixed)`, the second term a dry run (no booking) on the same pre-drawn randomness and state; evaluation is unchanged.
-  - *Why:* the day-by-day signal is tiny (median action gap 4.6 € against a daily SD of 399 €), and most of that noise is shared by both prices.
-  - `reset()` draws all randomness before pricing, so the baseline doesn't depend on the action; only multi-night stays add a small bias.
-  - *Test:* plain vs this reward, 150k × 3 seeds, both algorithms, decided on holdout seasons. Run it before tuning.
+**Agent revenue** (the main aim): the per-date schedule is worth about +0.65 points over best fixed. PPO got +0.48–0.51 of it before the CRN reward, which added about +0.3 (PPO) and +0.6 (Double DQN) at 300k steps (22 Oct findings).
 - **Optuna tuning (P2, 3):** on the final world and reward.
-  - **Gate first:** at the same final training budget, pretuned settings vs a 16-trial study per algorithm (150k × 3 seeds, rf world), decided on holdout seasons 400000–400199.
+  - **Gate first:** at the same final training budget, pretuned settings vs a 16-trial study per algorithm (150k × 3 seeds, rf world), decided on holdout seasons 410000–410199 (400000–400199 decided the CRN reward).
   - **If Optuna wins, run the full study:**
     - objective: mean % vs best fixed over the rf and xgb worlds;
     - 24 trials per algorithm, with the pretuned config enqueued first;
@@ -425,12 +452,9 @@ Nothing here is implemented. Importance: **P1** = needed before the final thesis
     - pruning on the validation curve, and the top 3 trials rescored with fresh seeds;
     - 300k steps per trial, about 4–5 hours.
   - Until it is adopted, install `optuna` in scratch only.
-- **Budget gate (P2, 1):** the default is 900k steps, but the settings were tuned at 300k. Compare 900k with 300k on tuning seasons, and keep 900k only if it is more than 1 SE better: LR decay and exploration are fractions of the run, so 900k stretches both, and the curves plateau at 150–200k.
-- **Seed ensemble (P2, 1):** a majority vote of all seeds' greedy actions (ties go to the median multiplier), as an extra row. Adopt it only if it beats the mean of seeds on validation. It uses every seed, so it isn't a best-seed pick, and it should damp the wandering between price levels.
 - **Narrower action grid (P3):** 0.90–1.20× halved the RL loss in a 2-seed test. As the main grid it would change the level effect and comparability, so the price-range check covers it.
 
 **Benchmarks and robustness** (the thesis story):
-- **Per-date upper bound (P1, 2):** the per-date schedule (chosen on validation seasons; +0.6–0.75% over best fixed, measured before the G3 fix) as a results row, so RL is reported as a share of the day-by-day value available.
 - **Robustness (P2, 2–3):** `--robustness`, evaluation only. It tests each checkpoint, the hotel and best fixed on the test seasons in:
   - the other ML world;
   - ε 0.8 / 1.2;
@@ -438,7 +462,7 @@ Nothing here is implemented. Importance: **P1** = needed before the final thesis
   - the 2025 offline calendar.
 
   If the agents prove fragile, train across worlds (domain randomisation).
-- **Price-range check (P2, 1–2):** best fixed, the per-date bound and one PPO run with multipliers in the hotel's observed range (0.95–1.10×), to show how much of the level gain extrapolates `g(p)`. It matters more if a per-date world (best price 1.20–1.25×) is adopted.
+- **Price-range check, RL part (P3, 2):** one PPO run with multipliers limited to the hotel's range (0.95–1.10×); it needs a multipliers option in the env. The 22 Oct benchmarks already show no day-by-day value inside that range, so expect none.
 - **Contextual-bandit baseline (P3, 2–3):** the MDP is close to one. It separates "RL is weak" from "there is little value to find".
 - **Best fixed price:** keep it (no switch, not removed). It separates the elasticity-driven level effect from the RL's day-by-day value.
 

@@ -114,8 +114,9 @@ class HotelEnv(gym.Env):
     def step(self, action):
         return self.step_price(self.prices[int(action)])
 
-    def step_price(self, price):
-        """Simulate arrival date t at an explicit price (used by baselines)."""
+    def _book(self, price, committed):
+        """The requests of arrival date t at price, booked into committed
+        (changed in place): (reward, counts)."""
         t = self.t
         lam = self.lambda_base[t] * self._g(price) * self.shock[t]
         n_requests = poisson_from_uniform(self.u_count[t], lam)
@@ -127,7 +128,7 @@ class HotelEnv(gym.Env):
         recorded = 0         # rooms the booking data would hold: requests whose stay fitted
         for i in picks:
             rooms, nights = pool["rooms"][i], pool["nights"][i]
-            fits = self.committed[t:t + nights].max() + rooms <= self.capacity
+            fits = committed[t:t + nights].max() + rooms <= self.capacity
             if pool["cancelled"][i]:
                 cancelled += 1
                 recorded += rooms * fits
@@ -135,7 +136,7 @@ class HotelEnv(gym.Env):
             if not fits:
                 lost += 1
                 continue
-            self.committed[t:t + nights] += rooms
+            committed[t:t + nights] += rooms
             # Total = its BAR x its own occupancy/channel/plan factors -> same factors at this BAR
             revenue += pool["total"][i] * price / pool["orig_price"][i]
             room_nights += rooms * nights
@@ -143,9 +144,20 @@ class HotelEnv(gym.Env):
             recorded += rooms
 
         reward = revenue - self.variable_cost * room_nights
-        info = dict(date=self.dates[t], price=float(price), requests=int(n_requests),
-                    accepted=accepted, cancelled=cancelled, lost=lost, recorded=int(recorded),
-                    revenue=revenue, room_nights=room_nights,
+        return reward, dict(requests=int(n_requests), accepted=accepted, cancelled=cancelled,
+                            lost=lost, recorded=int(recorded), revenue=revenue,
+                            room_nights=room_nights)
+
+    def dry_run(self, price):
+        """The reward date t would earn at price, from the same pre-drawn
+        requests and the same calendar, with nothing booked (a training baseline)."""
+        return self._book(price, self.committed.copy())[0]
+
+    def step_price(self, price):
+        """Simulate arrival date t at an explicit price (used by baselines)."""
+        t = self.t
+        reward, counts = self._book(price, self.committed)
+        info = dict(date=self.dates[t], price=float(price), **counts,
                     occupied=int(self.committed[t]))
         self.t += 1
         terminated = self.t >= self.n_days
