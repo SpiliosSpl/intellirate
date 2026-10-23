@@ -392,7 +392,7 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
     - Agents trained in either world score the same in both: PPO new − old ≤ 0.02 ± 0.12, and the old PPO agents beat best fixed in the new world by +0.33 / +0.27%.
   - Absolute revenue is 0.3–0.5% higher in the new world for every policy, because it loses fewer requests; pricing is no better.
   - **The RL fixes change nothing else:** with the same world, results, validation curves, episodes and weights are identical with and without them; only `sensitivity.csv` and the log column differ.
-- **Full run, 900k × 5 seeds, G3 world (21 Oct, plain revenue reward; the next full run overwrites its `results_2026_*_e1.0`):**
+- **Full run, 900k × 5 seeds, G3 world (21 Oct, plain revenue reward; its `results_2026_*_e1.0` were overwritten by the 22 Oct final run):**
   - Best fixed 1.15× in both worlds: +1.50% (rf) / +1.64% (xgb) vs hotel.
   - PPO: +1.99 / +2.16% vs hotel, +0.48 ± 0.08 / +0.51 ± 0.08% vs best fixed.
   - Double DQN: +1.32 / +1.56% vs hotel, −0.18 / −0.08% vs best fixed.
@@ -420,28 +420,77 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
     - In both algorithms, every seed trained with the baseline beats every seed trained on revenue. Double DQN beats best fixed for the first time.
     - Training is 1–4% slower. Adopted for both (`BASELINE_REWARD`). Results and elasticity-log rows from before 22 Oct used plain revenue.
   - **Batched evaluation:** identical per-season results on the 200 test seasons for the 21 Oct seed-42 checkpoints, 2.6–4.8× faster.
-  - **Seed ensemble:** a median of two actions always takes the lower price, so it needs an odd number of seeds. Its value is known only after a full run.
+  - **Seed ensemble:** a median of two actions always takes the lower price, so it needs an odd number of seeds. Its value is in the final run (next item).
+- **Final full run (22 Oct; 900k × 5 seeds, CRN reward, G3 world, `sim_data` 703d2f9b6331). These are the thesis numbers, in `results_2026_*_e1.0` and `comparison_2026_e1.0`.** Test seasons, rf / xgb; mean-of-seeds rows have 95% CIs that include the seed variance:
+
+  | Policy | vs hotel | vs best fixed |
+  |---|---|---|
+  | Best fixed (1.15×) | +1.50 / +1.64% | – |
+  | Per-date schedule | +2.16 / +2.28% | +0.65 / +0.63% |
+  | PPO, mean of seeds | +2.11 ± 0.30 / +2.25 ± 0.30% | +0.61 ± 0.26 / +0.60 ± 0.21% |
+  | PPO, seed ensemble | +2.17 / +2.31% | +0.66 / +0.65% |
+  | Double DQN, mean of seeds | +1.98 ± 0.31 / +2.15 ± 0.35% | +0.48 ± 0.18 / +0.50 ± 0.21% |
+  | Double DQN, seed ensemble | +2.16 / +2.28% | +0.65 / +0.63% |
+
+  - **The CRN reward at full scale.** The world is the same as on 21 Oct (identical hotel and best fixed revenue). PPO vs best fixed went from +0.48 / +0.51 to +0.61 / +0.60, and Double DQN from −0.18 / −0.08 to +0.48 / +0.50.
+  - **The RL now reaches the per-date schedule.** PPO captures 94–96% of the schedule's day-by-day value and the ensembles match it. The seed spread is 0.03–0.11 points.
+  - **The seed ensemble is the adopted policy.** It beat the mean of seeds on validation in all four combinations, which is the rule set before the run. Report the mean of seeds next to it. The ensemble's error bar is season noise only.
+  - **Sim vs real at the hotel's prices:** revenue −0.6 / −0.4%, bookings +0.4 / +0.7%.
+  - **The agents sell more room-nights than best fixed at a lower ADR** (PPO rf: 671 vs 638 room-nights, 152 vs 159 €).
+    - They price above the hotel's range on 43–45% (PPO) and 57–62% (Double DQN) of days.
+    - They lose 55–69 requests per season, against 85–95 for the hotel.
+    - The chosen checkpoints are at 75k–901k steps (PPO) and 350k–825k (Double DQN).
+  - **Sensitivity (best fixed vs hotel):** +10.8 / +10.9% (ε 0.6), +5.9 / +6.1% (0.8), +1.5 / +1.6% (1.0), −0.1 / −0.1% (1.2), +1.2 / +1.3% (1.5). The best price is 1.25×, the grid edge, at ε ≤ 0.8.
+- **Final code review and robustness diagnostics (23 Oct; read-only).** Run in memory on the repo's `sim_data.pkl` and the 22 Oct checkpoints, so nothing was written. They used seasons 700000–700199 and 900000–900029, which nothing else uses. None of these numbers can be reproduced from the repo yet; `robustness.py` (future work) would fix that.
+  - **No bug changes a result.**
+    - **Env invariants** (2 worlds × 30 seasons): requests are monotone in price on every day, `dry_run` equals the step's reward exactly, and the same seed reproduces the same season.
+    - **Also checked:** `DoubleDQN.train`, terminal handling, seed ranges, the ML guardrails, the calibration loop, the SEs, and the profiles (no zero-night stays, no missing `orig_price`).
+    - The 22 Oct results come from the code in commit d0564fe.
+    - **Cosmetic only:** `stay_mean`'s docstring says an unknown night gives NaN, but `groupby().mean()` skips NaN; this never happens, because the nightly BAR is interpolated. In `holiday_features`, 25 March lies outside the summer window.
+  - **Anonymity:** no word of the data's `Property` / `Property Name` values appears in any tracked file or in git history. The only hit is the export's "Summary" footer row.
+  - **The world remembers 2026's days.** `lambda_true` (the in-sample fit) ranks the real 2026 days at Spearman 0.74 (rf) / 0.70 (xgb), against 0.27 for an out-of-bag RF and 0.35 for the forecast. Every episode uses the same per-date demand, so an agent could learn the season in hindsight.
+  - **The day-by-day gain doesn't rely on that.** Figures are rf, % vs 1.15×, on 200 seasons from 700000. The shaped worlds keep the season total, `k` and the offline calendar.
+    - **The 22 Oct agents in worlds with another per-date pattern:** PPO +0.51% in the training world, +0.43% with forecast-shaped demand, +0.56% with OOB-shaped demand. Double DQN: +0.40 / +0.23 / +0.47%.
+    - **A per-date schedule chosen in a shaped world** (200 validation seasons) earns +0.24 / +0.23% in the training world, against +0.36% when chosen there. So about two thirds of its value can be known in advance (offline calendar, calendar features).
+  - **What the agents learned is a capacity rule.**
+    - PPO's multiplier follows the rooms left tonight (correlation −0.88): 1.25× at ≤ 4 rooms left, 1.22× at 5–7, 1.16× at 8–10, 1.06× at ≥ 11. It ignores the forecast (−0.08).
+    - Double DQN does the same, less sharply (−0.33).
+    - The 1.25× cap binds on about a quarter of days. The grid stays, for realism (see Multipliers).
+  - **A rooms-left rule comes close.**
+    - **How it was built:** one multiplier per bucket of rooms left (1–2 / 3–4 / 5–7 / 8–10 / 11–13 / 14–17), chosen by coordinate ascent on validation seasons 100000–100199.
+    - **What it chose:** 1.25× at 1–7 rooms left (xgb 1.20× at 5–7), 1.15× at 8–10 and 1.05–1.10× at ≥ 11.
+    - **Result:** +0.44% (rf) / +0.48% (xgb) vs best fixed, on the seasons from 700000 where PPO got +0.51% and Double DQN +0.40% (rf). PPO's lead over the rule hasn't been tested for significance.
+    - **Conclusion:** the RL finds the capacity rule by itself and PPO slightly beats it. Most of the day-by-day value is capacity-based pricing.
+  - **ε = 1 is a neutral assumption.** Unconstrained revenue `p·g(p)` peaks at `p_ref/ε`. At ε = 1 the hotel's median BAR is therefore revenue-optimal when rooms are plentiful, and the whole gain comes from scarcity and day-by-day pricing. This also explains the sensitivity edges (at ε = 0.8 the optimum is exactly 1.25×).
+  - **Revenue basis:** `Total` is gross for Booking.com and net for Expedia Collect. Every policy gets the same channel mix, so relative gains are unaffected; state it as a limitation.
 - **Elasticity:** keep 1.0 as the main scenario. Per the hotel, its main competitor is usually 5–15% cheaper for this room type (sometimes more expensive), so ε well below 1 would imply implausible premiums; report about 0.8–1.5 as sensitivity.
 
 Cross-file contracts: `bar_rates.py` imports `load_raw`, `file_hash`, `SEASONS`, `SUMMER`, `XLSX_PATH` and `BAR_DIR` from `ml_demand_model.py`, which in turn reads `bar_exports/bar_daily.csv` / `bar_bookings.csv` (`load_bar` fails loudly if they are missing, don't cover every booking, or `bar_inputs.sha256` no longer matches `BOOKINGS.xlsx` and the rate CSVs: re-run `bar_rates.py` after changing them or the load filters). `rl_agent.py` imports `PRICE_MULTIPLIERS` and `SIM_DATA_PATH` from the env, and `file_hash` from `ml_demand_model.py` inside `append_elasticity_log`, so worker processes don't load the ML stack. The env depends on the exact `sim_data.pkl` schema produced by `build_sim_data` (per season: `capacity`, `online_avail`, `dispersion_k`, `dates`, `lambda_true`, `lambda_forecast`, `hotel_price`, `p_ref`, calendar arrays, `profiles`, `actual`; top level: `seasons`, `models`). `actual` also holds the calibration targets `requests_var` and `sold_out_nights`. After changing that schema, `BOOKINGS.xlsx` or `hotel_pms_data.csv`, you must re-run `ml_demand_model.py`. `ml_demand_model.py` imports `HotelEnv` inside `simulate_hotel` to calibrate, and calibrates on the env's `info["recorded"]` and `info["room_nights"]`. Model keys `"rf"` / `"xgb"` are shared across the ML, env and RL files.
 
 ## Future and proposed work
 
+**Status (23 Oct 2026):**
+- The ML and RL code is frozen for the professors' review, and the 22 Oct run is final. Only printing changes are planned before the review; everything else below comes after it.
+- Send the repo through git (a link or `git archive`), never as a zipped folder: a zip would include the private data and `sim_data.pkl`.
+
 Nothing here is implemented. Importance: **P1** = needed before the final thesis run (correctness, realism or protocol); **P2** = likely to raise agent revenue or make the results more defensible; **P3** = if time allows; **Later** = beyond the thesis, described as a limitation. Effort: 1 (quick) … 5 (long). Test every item in a scratch copy, choose only on validation, tuning or holdout seasons (never test), and apply after approval. Items that change `online_avail` or the world need an ML + RL rerun, so do them together.
 
-**Order:** world and data fixes (one ML rerun) → tuning → robustness and the RL price-range run → final full run → docs.
+**Order:**
+1. `robustness.py` (no rerun).
+2. World calibration and tuning, only if the thesis needs them. Each needs a full rerun.
+3. Docs.
 
 **World and data** (P1 unless marked):
 - **World calibration.** Choose the world by realism (recorded requests, their variance, room-nights, sold-out nights), never by RL revenue. Until it is settled, report the ε = 1 level gain as the range +0.9 to +3.1% with the reason (see the calibration findings).
   - **Per-date calibration (P2, 3–4):** the remaining realism gap of the applied one-factor world is about 42–43 sold-out nights against 32 real, 17 of them on nights that had rooms left. The prototype matches recorded requests per date and their variance. Its open issues are 46–50 sold-out nights (against 34 real before the PMS fix), room-nights 2.5–3.5% short, and a result that depends on the cap (+2.1 to +3.1%). Next: build it on the applied joint solver (uplift per date plus `k`), aiming at recorded variance and sold-out nights, then check whether the room-nights close.
   - **Censored likelihood (P3, 4):** an untested alternative. Scaling only censored nights doesn't work.
-- **Env invariant checks (P3, 1–2):** a small check script: the same seed gives the same season, and demand is monotone in price.
+- **Env invariant checks (P3, 1):** checked in memory on 23 Oct, and all held (see that finding). A small script would make the check repeatable.
 
 **RL code:**
 - **One process pool (P2, 1):** all ML × RL × seed jobs in one pool, about 25–35% less wall time.
 - **Diagnostics (P3, 1):** log in `ValidationCheckpoint` (TensorBoard) the validation gain, a histogram of the chosen multipliers, mean price / occupancy / lost requests and the price–forecast correlation, plus PPO's KL, entropy and explained variance.
 
-**Agent revenue** (the main aim): the per-date schedule is worth about +0.65 points over best fixed. PPO got +0.48–0.51 of it before the CRN reward, which added about +0.3 (PPO) and +0.6 (Double DQN) at 300k steps (22 Oct findings).
+**Agent revenue** (the main aim): the per-date schedule is worth about +0.65 points over best fixed, and the final run reaches it (PPO +0.61 / +0.60, the ensembles +0.63–0.66). It is not a ceiling, since a policy that sees the rooms left can beat it. Still, tuning can add little, and only through capacity pricing that a rooms-left rule already gets mostly right (23 Oct findings).
 - **Optuna tuning (P2, 3):** on the final world and reward.
   - **Gate first:** at the same final training budget, pretuned settings vs a 16-trial study per algorithm (150k × 3 seeds, rf world), decided on holdout seasons 410000–410199 (400000–400199 decided the CRN reward).
   - **If Optuna wins, run the full study:**
@@ -455,15 +504,20 @@ Nothing here is implemented. Importance: **P1** = needed before the final thesis
 - **Narrower action grid (P3):** 0.90–1.20× halved the RL loss in a 2-seed test. As the main grid it would change the level effect and comparability, so the price-range check covers it.
 
 **Benchmarks and robustness** (the thesis story):
-- **Robustness (P2, 2–3):** `--robustness`, evaluation only. It tests each checkpoint, the hotel and best fixed on the test seasons in:
-  - the other ML world;
-  - ε 0.8 / 1.2;
-  - demand ×0.85 / ×1.15, through a `demand_scale` env argument that keeps common random numbers (×0.85 ≈ the uncalibrated world);
-  - the 2025 offline calendar.
-
-  If the agents prove fragile, train across worlds (domain randomisation).
+- **Robustness (P2, 2; tried in memory on 23 Oct, see that finding):** a separate `robustness.py`, evaluation only. It changes no existing file, needs no rerun and takes about 40 min.
+  - **Policies,** all deployed unchanged from the training world: the hotel, best fixed (`find_best_fixed` on validation), a rooms-left rule chosen on validation, and each algorithm's checkpoints (mean of seeds and ensemble).
+  - **Scenarios,** built in memory from `sim_data.pkl`, so the env needs no new argument:
+    - the own world, which must reproduce `results.csv` as a check;
+    - the other ML world;
+    - forecast-shaped demand;
+    - demand ×0.85 / ×1.15 (×0.85 ≈ the uncalibrated world);
+    - ε 0.8 / 1.2;
+    - optionally, the 2025 offline calendar.
+  - **Scoring:** on the test seasons, vs hotel, vs best fixed and vs the rule (paired).
+  - **Outputs:** `robustness_<tag>.csv` and `policy_map_<tag>.csv` (mean multiplier by rooms left). Add both patterns to `.gitignore`.
+  - If the agents prove fragile, train across worlds (domain randomisation).
 - **Price-range check, RL part (P3, 2):** one PPO run with multipliers limited to the hotel's range (0.95–1.10×); it needs a multipliers option in the env. The 22 Oct benchmarks already show no day-by-day value inside that range, so expect none.
-- **Contextual-bandit baseline (P3, 2–3):** the MDP is close to one. It separates "RL is weak" from "there is little value to find".
+- **Contextual-bandit baseline (P3, 2–3):** the MDP is close to one. The rooms-left rule (23 Oct) is a simple bandit and already answers the main question: the RL roughly equals the rule, with PPO slightly ahead. A bandit learned on the full observation would add little.
 - **Best fixed price:** keep it (no switch, not removed). It separates the elasticity-driven level effect from the RL's day-by-day value.
 
 **Later** (state as limitations):
