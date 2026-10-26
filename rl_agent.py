@@ -299,6 +299,11 @@ def elasticity_log_path(model_name, args):
     return ELASTICITY_LOG.format(model=model_name + world)
 
 
+def steps_tag(timesteps):
+    """Timesteps in output names: 900000 -> 900k, 12345 -> 12345."""
+    return f"{timesteps // 1000}k" if timesteps % 1000 == 0 else str(timesteps)
+
+
 def check_elasticity_log(path):
     """Fail if an existing log has another header (main checks before training)."""
     if os.path.exists(path) and pd.read_csv(path, nrows=0).columns.tolist() != log_columns():
@@ -503,7 +508,8 @@ def run_pipeline(model_name, args):
     label = MODEL_NAMES[model_name] + (f" (world {MODEL_NAMES[world]})"
                                        if args.common_world else "")
     suffix = f"_world-{world}" if args.common_world else ""
-    out_dir = f"results_{args.season}_{model_name}_e{args.elasticity}{suffix}"
+    out_dir = (f"results_{args.season}_{model_name}_e{args.elasticity}"
+               f"_t{steps_tag(args.timesteps)}{suffix}")
     os.makedirs(out_dir, exist_ok=True)
     log = []
 
@@ -741,7 +747,7 @@ def main():
         check_elasticity_log(elasticity_log_path(m, args))
 
     comp = pd.DataFrame([row for m in args.models for row in run_pipeline(m, args)])
-    tag = f"{args.season}_e{args.elasticity}" + (
+    tag = f"{args.season}_e{args.elasticity}_t{steps_tag(args.timesteps)}" + (
         f"_world-{args.common_world}" if args.common_world else "")
     comp.to_csv(f"comparison_{tag}.csv", index=False)
     plot_comparison(comp, f"comparison_{tag}.png",
