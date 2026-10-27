@@ -34,7 +34,7 @@ class HotelEnv(gym.Env):
 
     def __init__(self, season=2025, demand_model="rf", forecast_model=None,
                  elasticity=ELASTICITY, variable_cost=VARIABLE_COST,
-                 sim_path=SIM_DATA_PATH, sim=None):
+                 sim_path=SIM_DATA_PATH, sim=None, demand_scale=1.0):
         super().__init__()
         data = sim if sim is not None else joblib.load(sim_path)   # sim: the dict itself
         s = data["seasons"][season]
@@ -44,6 +44,7 @@ class HotelEnv(gym.Env):
         self.season        = season
         self.elasticity    = elasticity
         self.variable_cost = variable_cost
+        self.demand_scale  = demand_scale
         self.capacity      = s["capacity"]                        # rooms of this season
         # Rooms left for online sale each night (PMS); the rest are offline stays
         self.online_avail  = s["online_avail"]
@@ -61,8 +62,9 @@ class HotelEnv(gym.Env):
         self.actual      = s["actual"]
         self.prices      = self.p_ref * np.array(PRICE_MULTIPLIERS)
 
-        # Demand at the reference price (hotel's own price effect removed)
-        self.lambda_base = s["lambda_true"][demand_model] / self._g(self.hotel_price)
+        # Demand at the reference price (hotel's own price effect removed); demand_scale
+        # rescales it for robustness tests, with the pre-drawn randomness unchanged
+        self.lambda_base = demand_scale * s["lambda_true"][demand_model] / self._g(self.hotel_price)
         self.forecast_scale = float(np.max(self.forecast))
 
         # Booking profiles as plain arrays (fast sampling)

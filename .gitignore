@@ -16,3 +16,5 @@ comparison_*.png
 *.zip
 learning_curve.png
 elasticity_log_*.csv
+robustness_*/
+ml_reference/

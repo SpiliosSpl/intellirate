@@ -23,6 +23,13 @@ python ml_demand_model.py      # BOOKINGS.xlsx + bar_*.csv + hotel_pms_data.csv 
 python rl_agent.py             # sim_data.pkl -> results_<season>_<model>_e<elasticity>_t<steps>/, comparison_<tag>.csv/.png, elasticity_log_<model>.csv
 ```
 
+Evaluation only (no training; they read existing outputs and write only their own folder):
+
+```
+python ml_reference.py         # same inputs as ml_demand_model.py -> ml_reference/: ml_table.csv (ml_comparison.csv + GLM / Ridge reference rows), ml_reference_comparison.csv, ml_reference_cv_grid.csv, summary.txt
+python robustness.py           # a finished run's checkpoints + sim_data.pkl -> robustness_<season>_e<elasticity>_t<steps>/: baselines.csv, significance.csv, robustness.csv, policy_map.csv, rooms_left_rule.csv, per_season.csv, reproduction.csv, summary.txt (about 9 min with --jobs 6, the default)
+```
+
 Useful `rl_agent.py` flags for quick or partial runs:
 - `--models rf` (or `xgb`) runs only one pipeline.
 - `--algos ppo` (or `ddqn`) trains only one RL algorithm (default: all keys in `ALGOS`).
@@ -31,7 +38,7 @@ Useful `rl_agent.py` flags for quick or partial runs:
 - `--common-world rf` makes every pipeline use the same "true" demand model while each agent keeps its own forecast. The output directories and tags get a `_world-<m>` suffix.
 - `--jobs 5` (the default) trains the seeds of each ML × RL combination in parallel processes, each with one torch thread. Parallelism is per seed, so at most `len(--seeds)` processes run. `--jobs 1` runs sequentially and gives identical results. A GPU doesn't help here: the networks are tiny and the bottleneck is Python overhead per step.
 
-The repo has no tests, linter or build step. `.gitignore` uses patterns: the private data in any format (`BOOKINGS.*`, `hotel_pms_data.*`; see Other data files) and every generated artifact (`*.pkl`, `*.zip`, `bar_exports/`, `ml_comparison.csv`, `ml_cv_grid.csv`, `demand_fit.png`, `results_*/`, `comparison_*`, `elasticity_log_*.csv`, `logs/`) are ignored, so runs for any season, elasticity or world stay out of the repo. The two rate config files (`rate_rules.csv`, `rate_occupancy.csv`) are tracked. The pipeline runs without warnings (the Excel export's openpyxl style warning is silenced in `load_raw`); keep it that way rather than running with `-W ignore`. Check a change with `python -W error <script>`: a warning is easy to miss in the printed report, and with `-W error` the run stops at it. A warning raised while an object is garbage-collected (an unclosed file, for example) only prints as "Exception ignored" and doesn't stop the run, so also grep the log for `Warning`.
+The repo has no tests, linter or build step. `.gitignore` uses patterns: the private data in any format (`BOOKINGS.*`, `hotel_pms_data.*`; see Other data files) and every generated artifact (`*.pkl`, `*.zip`, `bar_exports/`, `ml_comparison.csv`, `ml_cv_grid.csv`, `demand_fit.png`, `results_*/`, `comparison_*`, `elasticity_log_*.csv`, `robustness_*/`, `ml_reference/`, `logs/`) are ignored, so runs for any season, elasticity or world stay out of the repo. The two rate config files (`rate_rules.csv`, `rate_occupancy.csv`) are tracked. The pipeline runs without warnings (the Excel export's openpyxl style warning is silenced in `load_raw`); keep it that way rather than running with `-W ignore`. Check a change with `python -W error <script>`: a warning is easy to miss in the printed report, and with `-W error` the run stops at it. A warning raised while an object is garbage-collected (an unclosed file, for example) only prints as "Exception ignored" and doesn't stop the run, so also grep the log for `Warning`.
 
 **Testing rule: tests, checks and experiments must not make any permanent change to the repo's files unless the user explicitly says so.** That covers code, configs and docs, and also the generated outputs (`bar_exports/`, `*.pkl`, `ml_comparison.csv`, plots, `results_*`, `comparison_*`, `elasticity_log_*`). Run them on a copy of the project in the scratch directory (copy the `.py` files, the two rate CSVs, `BOOKINGS.xlsx`, `hotel_pms_data.csv`, `bar_exports/` and any other inputs needed), patch only that copy, and report before applying anything. To show that a change leaves results alone, compare the copy's outputs with the repo's: the BAR outputs, the xgb arrays, `demand_models.pkl` and `demand_fit.png` are bit-identical between runs, but the rf numbers (`n_jobs=-1`) differ at about 1e-16 relative, so compare `sim_data.pkl` and the ML CSVs by value, not by file hash. The `.xlsx` files differ only in their creation time (`docProps/core.xml`). The rule also means no smoke runs of `rl_agent.py` in the repo, because they append rows to the elasticity logs and overwrite any run of the same length. Applying a change only after the user approves it, and then regenerating the outputs it requires, is fine.
 
@@ -39,7 +46,7 @@ Two project rules: only the **summer season** is studied (arrivals 1 April – 3
 
 ## Architecture
 
-There are four files, forming one pipeline: **BAR reconstruction → ML demand model → simulator → RL agent**.
+There are four files, forming one pipeline: **BAR reconstruction → ML demand model → simulator → RL agent**, plus two evaluation-only scripts that read its outputs (items 4 and 5).
 
 0. **[bar_rates.py](bar_rates.py)** reconstructs the hotel's double-occupancy Best Available Rate (BAR) from the recorded prices. The rate system builds a price as `occupancy BAR × stacked discount factors`; the script unwinds that per booking:
    - [rate_rules.csv](rate_rules.csv): one row per discount/commission (NR, Genius, Last Minute Deal, Expedia promos and 18% commission, website direct offer / member programme), with detection column + regex, season, booking-date window, factor, optional `round_to` (rates rounded after discounts) and `confirmed`/`inferred` status. A `@infer` row (`genius_unflagged`) is decided per booking against the price ladder.
@@ -52,7 +59,7 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    RF and XGBoost (Poisson objective) each play **two roles with separate settings** (protocol "E revised", see the ML validation finding):
    - **Forecaster** (what the agent sees): settings from `GRID`, chosen only inside `TUNE_SEASON` = 2025 by `GroupKFold` blocked by ISO week, scored on uncensored days, best mean CV deviance (currently rf `min_samples_leaf=20, max_features=1.0`; xgb `max_depth=1, n_estimators=600`). It is then refit on 2025 and tested **once** on all of `TEST_SEASON` = 2026 (163 uncensored days) against the 2025 month mean, with 95% CIs from resampling whole ISO weeks. Out of time, neither model beats that baseline (gain CIs include 0); the level is about 0.54 of actual, but the env shows the agent only the pattern.
    - **World** (`lambda_true`): `WORLD_PARAMS` (rf `min_samples_leaf=3, max_features=0.6`; xgb `max_depth=3, n_estimators=400`), fitted on both seasons. It describes what happened, so it keeps the real day-of-week, holiday and peak structure; forecast-tuned settings would smooth it away.
-   - `ml_comparison.csv` has one row per `evaluation`: `test_2026`, `baseline` and `pooled_cv_reference`. The last is the old pooled GroupKFold with neighbouring 2026 weeks in training: optimistic (gain +1.0), so report it only as an upper bound. `ml_cv_grid.csv` has the CV score of every config.
+   - `ml_comparison.csv` has one row per `evaluation`: `test_2026`, `baseline` and `pooled_cv_reference`. The last is the old pooled GroupKFold with neighbouring 2026 weeks in training: optimistic (gain +1.0), so report it only as an upper bound. `ml_cv_grid.csv` has the CV score of every config. Linear reference rows come from `ml_reference.py` (item 5).
    - **Guardrails (the run fails):**
      - **G1:** the tune and test seasons split the table, settings are chosen on `TUNE_SEASON` rows only, and every forecast comes from a model that never saw that date.
      - **G2:** at least `MIN_TEST_DAYS` uncensored test days.
@@ -80,6 +87,7 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    - Each request samples a real booking profile. Cancelled profiles give no revenue, and profiles that don't fit under `capacity` over their nights are lost. `info["recorded"]` counts what the booking data would hold: the rooms of accepted requests plus cancelled requests whose stay would have fitted (`cancelled` and `lost` count cancelled requests whether they fit or not). Capacity is the season's physical STD rooms, stored per season in `sim_data.pkl` (`CAPACITY` in `ml_demand_model.py`, the length of `STD_ROOMS`): 18 in 2025 (including room 108) and 17 in 2026 (room 108 was renovated and is no longer STD). `reset()` pre-fills `committed` with the real offline stays (`capacity − online_avail`), so online sales are limited to the real online availability. The offline calendar is the same in every episode; only online demand is random. Revenue is the profile's real `Total` scaled by `price / orig_price`.
    - The observation has 9 dims in [-1, 1]: forecast, committed rooms today and tomorrow (offline stays included), cyclic month and day of week, holiday flag, and season progress.
    - `HotelEnv(..., sim=dict)` takes the sim data directly; the calibration uses this.
+   - `demand_scale` (default 1.0, bit-identical to before) multiplies `lambda_base`, with the pre-drawn randomness unchanged. Only `robustness.py` sets it.
    - Baselines use `step_price(price)` to pass an arbitrary price, for example the hotel's BAR. `dry_run(price)` returns the reward date `t` would earn at a price, from the same pre-drawn randomness and calendar, without booking anything (the training baseline in `rl_agent.py`).
    - **The env is the project's MDP** (the code never names it). The state is the day `t` plus the `committed` calendar, the action is the multiplier, the reward is revenue minus variable cost, the horizon is finite (one season) and γ = 0.9 is set in `rl_agent.py` (see the RL hyperparameter finding). Strictly it is a POMDP: the observation shows committed rooms only for tonight and tomorrow, so longer stays are partly hidden. With a mean stay of 1.26 nights, today's price barely affects later states, so the problem is close to a contextual bandit.
 
@@ -117,6 +125,32 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
 
      `comparison_<tag>.csv/.png` gets one row per ML × RL combination, with `rl_*` columns.
    - Every run appends one row per ML model to `elasticity_log_<model>.csv` (`append_elasticity_log`). Each row has the timestamp, the `protocol` (`val-test`), `sim_data` (the first 12 hex digits of `sim_data.pkl`'s SHA-256: rows with the same value come from the same world, and every ML rerun gives a new one, since rf refits differ by about 1e-16), season, elasticity, timesteps and seeds, the hotel revenue, the best fixed multiplier and its revenue, plus each algorithm's mean-of-seeds revenue and occupancy, all taken from `results.csv`. It tracks results across runs at different `--elasticity` values. A rerun adds a row instead of replacing one, and a skipped algorithm leaves its columns empty. If an existing log's columns don't match `log_columns()`, the run fails at the start, before any training: after a column change, rename the old logs (`_pre-valtest`, `_pre-simdata`). Runs in the repo append to it too, which is another reason to keep smoke runs in a scratch copy.
+
+4. **[robustness.py](robustness.py)** (evaluation only, no training) re-evaluates a finished run's saved checkpoints. Defaults: the final run (season 2026, ε 1.0, 900k, 5 seeds).
+   - **Fingerprint check (fails before any work):** the elasticity log's last row of the run must carry the current `sim_data.pkl` hash and `results.csv`'s revenues, and every checkpoint must exist. The `_e0.8` runs (world 9edc23a0db55) are refused.
+   - **Reproduction check:** the nominal world must rebuild every value of `results.csv` and the comparison exactly (`reproduction.csv`), otherwise it stops.
+   - **Rooms-left rule:** one level per bucket of rooms left tonight (`RULE_BUCKETS`, the 23 Oct buckets), monotone, read from `obs[1]` only. Coordinate ascent from best fixed on the best-fixed validation seasons.
+   - **Worlds (`WORLDS`, every policy deployed unchanged):** nominal, the other ML world (own forecast kept), ε 0.8 / 1.2, demand ×0.85 / ×1.15. Best fixed is reported at the nominal level and re-chosen on validation per world (an upper reference).
+   - **Significance:** paired over the 200 test seasons. Mean of seeds: `seed_se`, t(n−1); seeds and ensembles: z, descriptive. Holm (FWER 5%) over the primary family: mean of seeds × algorithm × ML model × {hotel, best fixed, schedule, rule}.
+   - **Outputs:**
+     - `baselines.csv`: the thesis table;
+     - `significance.csv`;
+     - `robustness.csv`;
+     - `policy_map.csv`: multiplier by rooms left tonight and forecast tercile, tidy;
+     - `rooms_left_rule.csv`;
+     - `per_season.csv`: the raw data behind every number;
+     - `reproduction.csv` and `summary.txt`.
+
+     `--jobs 1` and the default `--jobs 6` give identical files.
+
+5. **[ml_reference.py](ml_reference.py)** (evaluation only) adds reference forecasters to the ML table, validated exactly like rf / xgb (protocol E revised):
+   - **Models:** a Poisson GLM and a Ridge regression, with an L2 grid.
+   - **Encoding:** one-hot month and weekday plus the three holiday flags. Not `season` (constant in 2025) or the day-of-year trend.
+   - They never enter `sim_data.pkl`, so `ml_comparison.csv` stays as it is. Adding them there would mean an ML rerun, which gives a new `sim_data` hash and breaks the checkpoints' fingerprint.
+   - **Guards (it fails otherwise):**
+     - its daily table equals `sim_data.pkl`'s;
+     - its CV loop reproduces `ml_cv_grid.csv` for xgb;
+     - the baseline row equals `ml_comparison.csv`'s.
 
 ## Booking data and rates
 
@@ -441,7 +475,7 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
     - They lose 55–69 requests per season, against 85–95 for the hotel.
     - The chosen checkpoints are at 75k–901k steps (PPO) and 350k–825k (Double DQN).
   - **Sensitivity (best fixed vs hotel):** +10.8 / +10.9% (ε 0.6), +5.9 / +6.1% (0.8), +1.5 / +1.6% (1.0), −0.1 / −0.1% (1.2), +1.2 / +1.3% (1.5). The best price is 1.25×, the grid edge, at ε ≤ 0.8.
-- **Final code review and robustness diagnostics (23 Oct; read-only).** Run in memory on the repo's `sim_data.pkl` and the 22 Oct checkpoints, so nothing was written. They used seasons 700000–700199 and 900000–900029, which nothing else uses. None of these numbers can be reproduced from the repo yet; `robustness.py` (future work) would fix that.
+- **Final code review and robustness diagnostics (23 Oct; read-only).** Run in memory on the repo's `sim_data.pkl` and the 22 Oct checkpoints, so nothing was written. They used seasons 700000–700199 and 900000–900029, which nothing else uses. The rooms-left rule and the policy map are now reproducible from the repo with `robustness.py`, on the test seasons (27 Oct item); the shaped-world numbers are not.
   - **No bug changes a result.**
     - **Env invariants** (2 worlds × 30 seasons): requests are monotone in price on every day, `dry_run` equals the step's reward exactly, and the same seed reproduces the same season.
     - **Also checked:** `DoubleDQN.train`, terminal handling, seed ranges, the ML guardrails, the calibration loop, the SEs, and the profiles (no zero-night stays, no missing `orig_price`).
@@ -463,22 +497,55 @@ Other data files. Only the PMS file is used by the pipeline, and every private o
     - **Conclusion:** the RL finds the capacity rule by itself and PPO slightly beats it. Most of the day-by-day value is capacity-based pricing.
   - **ε = 1 is a neutral assumption.** Unconstrained revenue `p·g(p)` peaks at `p_ref/ε`. At ε = 1 the hotel's median BAR is therefore revenue-optimal when rooms are plentiful, and the whole gain comes from scarcity and day-by-day pricing. This also explains the sensitivity edges (at ε = 0.8 the optimum is exactly 1.25×).
   - **Revenue basis:** `Total` is gross for Booking.com and net for Expedia Collect. Every policy gets the same channel mix, so relative gains are unaffected; state it as a limitation.
+- **Robustness, official baselines, significance and linear ML references (27 Oct; applied; `robustness_2026_e1.0_t900k/`, `ml_reference/`).**
+  - **Scope:** evaluation only, on the 22 Oct checkpoints. All 442 values of `results.csv` and the comparison are rebuilt exactly.
+  - **`demand_scale` default:** checked bit-identical on the env arrays, 200 test seasons of every fixed level, `simulate_hotel`, a 20k RL smoke run and an ML rerun.
+  - **Rooms-left rule (chosen on validation):**
+    - **rf:** 1.25× at 0–7 rooms left, 1.15× at 8–10, 1.05× at ≥ 11.
+    - **xgb:** 1.25× at 0–4, 1.20× at 5–7, 1.15× at 8–10, 1.10× at 11–13, 1.05× at ≥ 14.
+    - **Test:** +0.46 / +0.38% vs best fixed (validation +0.58 / +0.56).
+  - **Significance** (mean of seeds, Holm over 16 tests):
+    - PPO and Double DQN beat the hotel (+2.0 to +2.3%) and best fixed (+0.48 to +0.61%, Holm p ≤ 0.028) in both worlds.
+    - They don't differ from the per-date schedule (−0.03 to −0.18%).
+    - Their lead over the rule (+0.01 to +0.22%) is not significant after Holm. The largest is XGB + PPO: p 0.012, Holm 0.10.
+    - The ensembles beat the rule by +0.18 to +0.28% (p ≤ 0.022), but their SE holds season noise only, so this is descriptive.
+  - **Policy map:** the PPO ensemble's multiplier falls smoothly with rooms left (1.25× at ≤ 5, 1.15× at 8, 1.01× at 17), and the PPO seeds average 1.12× in every forecast tercile. It is a capacity rule, as found on 23 Oct.
+  - **Robustness** (PPO mean of seeds, % vs best fixed at the nominal 1.15×, rf / xgb):
+
+    | World | Gain |
+    |---|---|
+    | Nominal | +0.61 / +0.60 |
+    | Other ML world | +0.51 / +0.67 |
+    | Demand ×0.85 | +0.42 / +0.67 |
+    | Demand ×1.15 | +0.53 / +0.72 |
+    | ε 1.2 | +1.51 / +1.46 (+0.28 / +0.38 vs the re-chosen 1.00×) |
+    | ε 0.8 | −0.26 / −0.22 (−1.70 / −1.74 vs the re-chosen 1.25×, the grid edge) |
+
+    - The day-by-day gain survives world and demand shifts. Under another ε the agents keep their ε = 1 level.
+    - Double DQN is similar but weaker (ε 1.2: −0.26 / −0.37 vs re-chosen).
+    - The re-chosen best fixed rows equal `sensitivity.csv`.
+  - **Linear references** (163 uncensored 2026 days, gain over the 2025 month mean):
+    - Poisson GLM (α 0.1): +0.14 [−0.08, +0.39];
+    - Ridge (α 10): +0.13 [−0.09, +0.36];
+    - against rf −0.11 and xgb −0.03.
+
+    No model beats the baseline significantly; the GLM has the best pattern deviance (2.19).
 - **Elasticity:** keep 1.0 as the main scenario. Per the hotel, its main competitor is usually 5–15% cheaper for this room type (sometimes more expensive), so ε well below 1 would imply implausible premiums; report about 0.8–1.5 as sensitivity.
 
-Cross-file contracts: `bar_rates.py` imports `load_raw`, `file_hash`, `SEASONS`, `SUMMER`, `XLSX_PATH` and `BAR_DIR` from `ml_demand_model.py`, which in turn reads `bar_exports/bar_daily.csv` / `bar_bookings.csv` (`load_bar` fails loudly if they are missing, don't cover every booking, or `bar_inputs.sha256` no longer matches `BOOKINGS.xlsx` and the rate CSVs: re-run `bar_rates.py` after changing them or the load filters). `rl_agent.py` imports `PRICE_MULTIPLIERS` and `SIM_DATA_PATH` from the env, and `file_hash` from `ml_demand_model.py` inside `append_elasticity_log`, so worker processes don't load the ML stack. The env depends on the exact `sim_data.pkl` schema produced by `build_sim_data` (per season: `capacity`, `online_avail`, `dispersion_k`, `dates`, `lambda_true`, `lambda_forecast`, `hotel_price`, `p_ref`, calendar arrays, `profiles`, `actual`; top level: `seasons`, `models`). `actual` also holds the calibration targets `requests_var` and `sold_out_nights`. After changing that schema, `BOOKINGS.xlsx` or `hotel_pms_data.csv`, you must re-run `ml_demand_model.py`. `ml_demand_model.py` imports `HotelEnv` inside `simulate_hotel` to calibrate, and calibrates on the env's `info["recorded"]` and `info["room_nights"]`. Model keys `"rf"` / `"xgb"` are shared across the ML, env and RL files.
+Cross-file contracts: `bar_rates.py` imports `load_raw`, `file_hash`, `SEASONS`, `SUMMER`, `XLSX_PATH` and `BAR_DIR` from `ml_demand_model.py`, which in turn reads `bar_exports/bar_daily.csv` / `bar_bookings.csv` (`load_bar` fails loudly if they are missing, don't cover every booking, or `bar_inputs.sha256` no longer matches `BOOKINGS.xlsx` and the rate CSVs: re-run `bar_rates.py` after changing them or the load filters). `rl_agent.py` imports `PRICE_MULTIPLIERS` and `SIM_DATA_PATH` from the env, and `file_hash` from `ml_demand_model.py` inside `append_elasticity_log`, so worker processes don't load the ML stack. The env depends on the exact `sim_data.pkl` schema produced by `build_sim_data` (per season: `capacity`, `online_avail`, `dispersion_k`, `dates`, `lambda_true`, `lambda_forecast`, `hotel_price`, `p_ref`, calendar arrays, `profiles`, `actual`; top level: `seasons`, `models`). `actual` also holds the calibration targets `requests_var` and `sold_out_nights`. After changing that schema, `BOOKINGS.xlsx` or `hotel_pms_data.csv`, you must re-run `ml_demand_model.py`. `ml_demand_model.py` imports `HotelEnv` inside `simulate_hotel` to calibrate, and calibrates on the env's `info["recorded"]` and `info["room_nights"]`. Model keys `"rf"` / `"xgb"` are shared across the ML, env and RL files. `robustness.py` imports its evaluation helpers and constants from `rl_agent.py` (one implementation) and reads the elasticity log's `sim_data`, `results.csv` and the comparison CSV, so a change to `summarise`, `seed_se` or the result names makes its reproduction check fail. `ml_reference.py` imports the loaders and scoring from `ml_demand_model.py` and repeats `main`'s load filters; if those change, its `sim_data` guard fails.
 
 ## Future and proposed work
 
-**Status (23 Oct 2026):**
+**Status (27 Oct 2026):**
 - The ML and RL code is frozen for the professors' review, and the 22 Oct run is final. Only printing changes are planned before the review; everything else below comes after it.
+- The 27 Oct evaluation additions (`robustness.py`, `ml_reference.py`, the env's `demand_scale`) change no result.
 - Send the repo through git (a link or `git archive`), never as a zipped folder: a zip would include the private data and `sim_data.pkl`.
 
 Nothing here is implemented. Importance: **P1** = needed before the final thesis run (correctness, realism or protocol); **P2** = likely to raise agent revenue or make the results more defensible; **P3** = if time allows; **Later** = beyond the thesis, described as a limitation. Effort: 1 (quick) … 5 (long). Test every item in a scratch copy, choose only on validation, tuning or holdout seasons (never test), and apply after approval. Items that change `online_avail` or the world need an ML + RL rerun, so do them together.
 
 **Order:**
-1. `robustness.py` (no rerun).
-2. World calibration and tuning, only if the thesis needs them. Each needs a full rerun.
-3. Docs.
+1. World calibration and tuning, only if the thesis needs them. Each needs a full rerun; afterwards rerun `robustness.py` and `ml_reference.py`.
+2. Docs.
 
 **World and data** (P1 unless marked):
 - **World calibration.** Choose the world by realism (recorded requests, their variance, room-nights, sold-out nights), never by RL revenue. Until it is settled, report the ε = 1 level gain as the range +0.9 to +3.1% with the reason (see the calibration findings).
@@ -504,20 +571,9 @@ Nothing here is implemented. Importance: **P1** = needed before the final thesis
 - **Narrower action grid (P3):** 0.90–1.20× halved the RL loss in a 2-seed test. As the main grid it would change the level effect and comparability, so the price-range check covers it.
 
 **Benchmarks and robustness** (the thesis story):
-- **Robustness (P2, 2; tried in memory on 23 Oct, see that finding):** a separate `robustness.py`, evaluation only. It changes no existing file, needs no rerun and takes about 40 min.
-  - **Policies,** all deployed unchanged from the training world: the hotel, best fixed (`find_best_fixed` on validation), a rooms-left rule chosen on validation, and each algorithm's checkpoints (mean of seeds and ensemble).
-  - **Scenarios,** built in memory from `sim_data.pkl`, so the env needs no new argument:
-    - the own world, which must reproduce `results.csv` as a check;
-    - the other ML world;
-    - forecast-shaped demand;
-    - demand ×0.85 / ×1.15 (×0.85 ≈ the uncalibrated world);
-    - ε 0.8 / 1.2;
-    - optionally, the 2025 offline calendar.
-  - **Scoring:** on the test seasons, vs hotel, vs best fixed and vs the rule (paired).
-  - **Outputs:** `robustness_<tag>.csv` and `policy_map_<tag>.csv` (mean multiplier by rooms left). Add both patterns to `.gitignore`.
-  - If the agents prove fragile, train across worlds (domain randomisation).
+- **More robustness worlds (P3, 1):** `robustness.py` (27 Oct) covers the other ML world, ε 0.8 / 1.2 and demand ×0.85 / ×1.15. Forecast-shaped demand and the 2025 offline calendar would each be one more `WORLDS` entry. At ε 0.8 the agents keep their ε = 1 level and trail a re-chosen 1.25× by about 1.7%; training across ε (domain randomisation) would address that.
 - **Price-range check, RL part (P3, 2):** one PPO run with multipliers limited to the hotel's range (0.95–1.10×); it needs a multipliers option in the env. The 22 Oct benchmarks already show no day-by-day value inside that range, so expect none.
-- **Contextual-bandit baseline (P3, 2–3):** the MDP is close to one. The rooms-left rule (23 Oct) is a simple bandit and already answers the main question: the RL roughly equals the rule, with PPO slightly ahead. A bandit learned on the full observation would add little.
+- **Contextual-bandit baseline (P3, 2–3):** the MDP is close to one. The rooms-left rule (an official baseline in `robustness.py` since 27 Oct) is a simple bandit and already answers the main question: the RL roughly equals the rule, and its lead is not significant after Holm. A bandit learned on the full observation would add little.
 - **Best fixed price:** keep it (no switch, not removed). It separates the elasticity-driven level effect from the RL's day-by-day value.
 
 **Later** (state as limitations):
