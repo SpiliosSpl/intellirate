@@ -30,6 +30,8 @@ python ml_reference.py         # same inputs as ml_demand_model.py -> ml_referen
 python robustness.py           # a finished run's checkpoints + sim_data.pkl -> robustness_<season>_e<elasticity>_t<steps>/: baselines.csv, significance.csv, robustness.csv, policy_map.csv, rooms_left_rule.csv, per_season.csv, reproduction.csv, summary.txt (about 9 min with --jobs 6, the default)
 ```
 
+The price recommendation notebook, `pricing_tool.ipynb` (item 6), runs in VS Code: install the Jupyter extension, choose the `intellirate-cpu` kernel and Run All (about 10 s). It writes no files.
+
 Useful `rl_agent.py` flags for quick or partial runs:
 - `--models rf` (or `xgb`) runs only one pipeline.
 - `--algos ppo` (or `ddqn`) trains only one RL algorithm (default: all keys in `ALGOS`).
@@ -46,7 +48,7 @@ Two project rules: only the **summer season** is studied (arrivals 1 April – 3
 
 ## Architecture
 
-There are four files, forming one pipeline: **BAR reconstruction → ML demand model → simulator → RL agent**, plus two evaluation-only scripts that read its outputs (items 4 and 5).
+There are four files, forming one pipeline: **BAR reconstruction → ML demand model → simulator → RL agent**, plus two evaluation-only scripts and a notebook that read its outputs (items 4–6).
 
 0. **[bar_rates.py](bar_rates.py)** reconstructs the hotel's double-occupancy Best Available Rate (BAR) from the recorded prices. The rate system builds a price as `occupancy BAR × stacked discount factors`; the script unwinds that per booking:
    - [rate_rules.csv](rate_rules.csv): one row per discount/commission (NR, Genius, Last Minute Deal, Expedia promos and 18% commission, website direct offer / member programme), with detection column + regex, season, booking-date window, factor, optional `round_to` (rates rounded after discounts) and `confirmed`/`inferred` status. A `@infer` row (`genius_unflagged`) is decided per booking against the price ladder.
@@ -151,6 +153,17 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
      - its daily table equals `sim_data.pkl`'s;
      - its CV loop reproduces `ml_cv_grid.csv` for xgb;
      - the baseline row equals `ml_comparison.csv`'s.
+
+6. **[pricing_tool.ipynb](pricing_tool.ipynb)** (evaluation only) is the prototype of the thesis's price recommendation tool, requested by the supervisor.
+   - **Input:** an arrival date of 2026 and the rooms left tonight (optionally tomorrow; by default only the real offline stays are taken then).
+   - **Output:**
+     - the BAR recommended by the PPO seed ensemble (rf), next to the hotel's BAR and best fixed;
+     - every ML × RL ensemble's price with its seeds' min–max;
+     - a what-if row over rooms left;
+     - the price path of test season `TEST_SEED0`.
+   - **How it works:** it reads the 900k checkpoints and traces them with `robustness.check_checkpoints`. It builds the observation by resetting the env and setting `committed` for tonight and tomorrow, then calling `_obs()`; a change to the observation must be reflected there. On a whole simulated season it reproduces every observation and action of the rollout.
+   - `%matplotlib inline` comes after the loading, because `rl_agent` and `ml_demand_model` switch matplotlib to Agg.
+   - The committed notebook keeps its outputs: they are the example a reader without the data sees.
 
 ## Booking data and rates
 
@@ -538,7 +551,7 @@ Cross-file contracts: `bar_rates.py` imports `load_raw`, `file_hash`, `SEASONS`,
 
 **Status (27 Oct 2026):**
 - The ML and RL code is frozen for the professors' review, and the 22 Oct run is final. Only printing changes are planned before the review; everything else below comes after it.
-- The 27 Oct evaluation additions (`robustness.py`, `ml_reference.py`, the env's `demand_scale`) change no result.
+- The 27 Oct evaluation additions (`robustness.py`, `ml_reference.py`, `pricing_tool.ipynb`, the env's `demand_scale`) change no result.
 - Send the repo through git (a link or `git archive`), never as a zipped folder: a zip would include the private data and `sim_data.pkl`.
 
 Nothing here is implemented. Importance: **P1** = needed before the final thesis run (correctness, realism or protocol); **P2** = likely to raise agent revenue or make the results more defensible; **P3** = if time allows; **Later** = beyond the thesis, described as a limitation. Effort: 1 (quick) … 5 (long). Test every item in a scratch copy, choose only on validation, tuning or holdout seasons (never test), and apply after approval. Items that change `online_avail` or the world need an ML + RL rerun, so do them together.
