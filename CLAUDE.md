@@ -36,6 +36,8 @@ The price recommendation notebook, `pricing_tool.ipynb` (item 6), takes about 10
 - **VS Code:** install the Jupyter extension, choose the `intellirate-cpu` kernel and Run All.
 - **Browser:** open Anaconda Prompt in `base` (Jupyter is installed there, not in `intellirate-cpu`), run `jupyter lab pricing_tool.ipynb` and choose the kernel "Python [conda env:intellirate-cpu]". The default "Python 3" is base's Python, without the packages. Base's `nb_conda_kernels` finds the env only when `conda` is on the PATH.
 
+`thesis_notes.md` (repo root, gitignored) is the brief for writing the thesis with Claude chat: aims, data, methods with their settings, results and limitations, in plain terms and without the code's internal labels. Update it whenever a result, setting or finding here changes, and keep the hotel anonymous in it.
+
 Useful `rl_agent.py` flags for quick or partial runs:
 - `--models rf` (or `xgb`) runs only one pipeline.
 - `--algos ppo` (or `ddqn`) trains only one RL algorithm (default: all keys in `ALGOS`).
@@ -95,7 +97,7 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    - `HotelEnv(..., sim=dict)` takes the sim data directly; the calibration uses this.
    - `demand_scale` (default 1.0, bit-identical to before) multiplies `lambda_base`, with the pre-drawn randomness unchanged. Only `robustness.py` sets it.
    - Baselines use `step_price(price)` to pass an arbitrary price, for example the hotel's BAR. `dry_run(price)` returns the reward date `t` would earn at a price, from the same pre-drawn randomness and calendar, without booking anything (the training baseline in `rl_agent.py`).
-   - **The env is the project's MDP** (the code never names it). The state is the day `t` plus the `committed` calendar, the action is the multiplier, the reward is revenue minus variable cost, the horizon is finite (one season) and γ = 0.9 is set in `rl_agent.py` (see RL design decisions). Strictly it is a POMDP: the observation shows committed rooms only for tonight and tomorrow, so longer stays are partly hidden. With a mean stay of 1.26 nights, today's price barely affects later states, so the problem is close to a contextual bandit.
+   - **The env is the project's MDP** (the code never names it). The state is the day `t` plus the `committed` calendar, the action is the multiplier, the reward is revenue minus variable cost, the horizon is finite (one season) and γ = 0.9 is set in `rl_agent.py` (see RL design decisions). Strictly it is a POMDP: the observation shows committed rooms only for tonight and tomorrow, so longer stays are partly hidden. With a mean stay of 1.37 nights (71% one-night stays; the `1.26` in `rl_agent.py`'s comment is outdated), today's price barely affects later states, so the problem is close to a contextual bandit.
 
 3. **[rl_agent.py](rl_agent.py)** runs one pipeline per ML model, and each pipeline trains every RL algorithm:
    - RL algorithms live in the `ALGOS` registry (`key -> (SB3 class, params, display name)`). `train_agent` is generic: SB3, CPU, `VecNormalize` on reward only, which is also valid for Double DQN because off-policy SB3 normalises replay-buffer rewards at sample time. To add an algorithm, add a registry entry.
@@ -260,7 +262,7 @@ PPO mean of seeds, % vs best fixed at the nominal 1.15×:
 - **CRN training reward** (rf, 300k, holdout seasons 400000–400199): +0.28 ± 0.12 (PPO) / +0.62 ± 0.16 (Double DQN) points vs best fixed over plain revenue, and every seed trained with it beat every seed trained on revenue. At 900k: PPO +0.48 → +0.61 and Double DQN −0.18 → +0.48 vs best fixed (rf). Results and log rows before 22 Oct used plain revenue.
 - **Checkpoint selection:** the final checkpoint was the old protocol's real problem; the validated one beat it on fresh seasons by +0.72 / +0.82 points (up to +2.4). The selection isn't optimistic (validation − test −0.09 / −0.04 points).
 - **Budget 900k:** in a 900k run, 6 of 10 PPO seeds chose a checkpoint at ≥ 700k steps, and the validation mean over 600–900k was 250–310 € above that over 150–300k.
-- **Observation (9 dims):** 7 nights of committed rooms and forecasts (20 dims) gave no gain. Every episode uses the same offline calendar, so the calendar features already encode upcoming group blocks, and with a mean stay of 1.26 nights tonight's free rooms carry almost all the signal. A variable cost (€20 / room-night) only raised the best price level.
+- **Observation (9 dims):** 7 nights of committed rooms and forecasts (20 dims) gave no gain. Every episode uses the same offline calendar, so the calendar features already encode upcoming group blocks, and with a mean stay of 1.37 nights tonight's free rooms carry almost all the signal. A variable cost (€20 / room-night) only raised the best price level.
 - **Price grid 0.75–1.25×:** widening it didn't help; 0.90–1.20× halved the RL loss in a 2-seed test (old constant-capacity world). Not widened: 1.25× already lies 13% above the hotel's highest price, and the cap binds on about a quarter of days.
 - **Seed ensemble:** needs an odd number of seeds (the median of two actions always takes the lower price).
 - **Season seeds already used:** validation 100000+, calibration 200000+, a schedule check 300000–300399, the CRN decision 400000–400199, test 500000+, diagnostics 700000–700199 and 900000–900029.
