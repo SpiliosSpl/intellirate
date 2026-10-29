@@ -132,10 +132,10 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
      - `<algo>_seed<n>.zip` (the selected checkpoint).
 
      `comparison_<tag>.csv/.png` gets one row per ML × RL combination, with `rl_*` columns.
-   - Every run appends one row per ML model to `elasticity_log_<model>.csv` (`append_elasticity_log`). Each row has the timestamp, the `protocol` (`val-test`), `sim_data` (the first 12 hex digits of `sim_data.pkl`'s SHA-256: rows with the same value come from the same world, and every ML rerun gives a new one, since rf refits differ by about 1e-16), season, elasticity, timesteps and seeds, the hotel revenue, the best fixed multiplier and its revenue, plus each algorithm's mean-of-seeds revenue and occupancy, all taken from `results.csv`. It tracks results across runs at different `--elasticity` values. A rerun adds a row instead of replacing one, and a skipped algorithm leaves its columns empty. If an existing log's columns don't match `log_columns()`, the run fails at the start, before any training: after a column change, rename the old logs (`_pre-valtest`, `_pre-simdata`). Runs in the repo append to it too, which is another reason to keep smoke runs in a scratch copy.
+   - Every run appends one row per ML model to `elasticity_log_<model>.csv` (`append_elasticity_log`). Each row has the timestamp, the `protocol` (`val-test`), `sim_data` (the first 12 hex digits of `sim_data.pkl`'s SHA-256: rows with the same value come from the same world, and every ML rerun gives a new one, since rf refits differ by about 1e-16), season, elasticity, timesteps and seeds, the hotel revenue, the best fixed multiplier and its revenue, plus each algorithm's mean-of-seeds revenue and occupancy, all taken from `results.csv`. It tracks results across runs at different `--elasticity` values. A rerun adds a row instead of replacing one, and a skipped algorithm leaves its columns empty. If an existing log's columns don't match `log_columns()`, the run fails at the start, before any training: after a column change, rename the old logs (`_pre-valtest`, `_pre-simdata`). The rows of older worlds, before the 29 Oct rerun, are in `elasticity_log_<model>_pre-0104c77364ca.csv`. Runs in the repo append to it too, which is another reason to keep smoke runs in a scratch copy.
 
 4. **[robustness.py](robustness.py)** (evaluation only, no training) re-evaluates a finished run's saved checkpoints. Defaults: the final run (season 2026, ε 1.0, 900k, 5 seeds).
-   - **Fingerprint check (fails before any work):** the elasticity log's last row of the run must carry the current `sim_data.pkl` hash and `results.csv`'s revenues, and every checkpoint must exist. The `results_*_e0.8_t900k` runs come from an older world (9edc23a0db55) and are refused.
+   - **Fingerprint check (fails before any work):** the elasticity log's last row of the run must carry the current `sim_data.pkl` hash and `results.csv`'s revenues, and every checkpoint must exist. All five 29 Oct runs (`results_2026_*_e<ε>_t900k`, ε 0.6 / 0.8 / 1.0 / 1.2 / 1.5) pass it, and each has its own `robustness_2026_e<ε>_t900k/`.
    - **Reproduction check:** the nominal world must rebuild every value of `results.csv` and the comparison exactly (`reproduction.csv`), otherwise it stops.
    - **Rooms-left rule:** one level per bucket of rooms left tonight (`RULE_BUCKETS`), monotone, read from `obs[1]` only. Coordinate ascent from best fixed on the best-fixed validation seasons.
    - **Worlds (`WORLDS`, every policy deployed unchanged):** nominal, the other ML world (own forecast kept), ε 0.8 / 1.2, demand ×0.85 / ×1.15. Best fixed is reported at the nominal level and re-chosen on validation per world (an upper reference).
@@ -197,7 +197,7 @@ Grouped by topic; each item gives the current conclusion. Numbers are rf / xgb o
 
 ### Final results (the thesis numbers)
 
-The 22 Oct run: 900k × 5 seeds, CRN reward, G3 world (`sim_data` 703d2f9b6331), in `results_2026_*_e1.0_t900k`, `comparison_2026_e1.0_t900k` and `robustness_2026_e1.0_t900k/`. Mean-of-seeds rows have 95% CIs that include the seed variance:
+The 29 Oct run, after a clean BAR + ML rerun (it reproduces the 22 Oct run exactly, every number below included): 900k × 5 seeds, CRN reward, G3 world (`sim_data` 0104c77364ca), in `results_2026_*_e1.0_t900k`, `comparison_2026_e1.0_t900k` and `robustness_2026_e1.0_t900k/`. Mean-of-seeds rows have 95% CIs that include the seed variance:
 
 | Policy | vs hotel | vs best fixed |
 |---|---|---|
@@ -218,9 +218,27 @@ The 22 Oct run: 900k × 5 seeds, CRN reward, G3 world (`sim_data` 703d2f9b6331),
 - **Sim vs real at the hotel's prices:** revenue −0.6 / −0.4%, bookings +0.4 / +0.7%.
 - **Sensitivity (best fixed vs hotel):** +10.8 / +10.9% (ε 0.6), +5.9 / +6.1% (0.8), +1.5 / +1.6% (1.0), −0.1 / −0.1% (1.2), +1.2 / +1.3% (1.5). The best price is 1.25×, the grid edge, at ε ≤ 0.8. At ε 1.5 the gain stays small because a lower price can't fill rooms that offline stays hold.
 
+### Agents trained at each elasticity (29 Oct runs)
+
+Same settings as the main run, one run per ε, `results_2026_*_e<ε>_t900k` and `robustness_2026_e<ε>_t900k/`. % vs best fixed:
+
+| ε | Best fixed (vs hotel) | Per-date schedule | Rooms-left rule | PPO mean / ensemble | Double DQN mean / ensemble |
+|---|---|---|---|---|---|
+| 0.6 | 1.25× (+10.81 / +10.89) | −0.01 / 0.00 | 0.00 / 0.00 | 0.00 / 0.00, 0.00 / 0.00 | −0.01 / −0.01, 0.00 / 0.00 |
+| 0.8 | 1.25× (+5.86 / +6.08) | −0.12 / −0.15 | 0.00 / 0.00 | 0.00 / 0.00, 0.00 / 0.00 | −0.01 / −0.03, 0.00 / 0.00 |
+| 1.0 | 1.15× (+1.50 / +1.64) | +0.65 / +0.63 | +0.46 / +0.38 | +0.61 / +0.60, +0.66 / +0.65 | +0.48 / +0.50, +0.65 / +0.63 |
+| 1.2 | 1.00× (−0.06 / −0.07) | +1.22 / +1.48 | +0.92 / +1.01 | +1.13 / +1.33, +1.14 / +1.35 | +1.04 / +1.24, +1.32 / +1.44 |
+| 1.5 | 0.85× (+1.20 / +1.26) | +2.46 / +2.47 | +1.61 / +1.57 | +2.21 / +2.19, +2.22 / +2.23 | +2.34 / +2.35, +2.49 / +2.48 |
+
+- **At ε ≤ 0.8 the grid cap leaves no day-by-day value.** Best fixed is 1.25×, the agents and the rule price there on (almost) every day, and the whole gain over the hotel is the level.
+- **The day-by-day value grows with ε.** Above 1, the unconstrained optimum `p_ref/ε` lies below the hotel's level, so nights with free rooms call for low prices and scarce nights for high ones. Vs best fixed, the mean of seeds is Holm-significant at ε 1.2 (+1.04 to +1.33, Holm p ≤ 0.004) and at ε 1.5 (+2.19 to +2.35, Holm p ≤ 0.0002). Vs the hotel: +0.98 to +1.27% at ε 1.2, +3.43 to +3.64% at ε 1.5. The agents price lower than the hotel there: ADR 131–133 € (ε 1.2) and 114–116 € (ε 1.5) against 136 €, online occupancy 37.3–37.8% and 43.9–44.5% against 35.9%.
+- **Only at ε 1.5 do the agents beat the rooms-left rule after Holm** (+0.59 to +0.77, Holm p ≤ 0.006). At ε 1.2 their lead is +0.12 to +0.32 (smallest Holm p 0.063). They never beat the per-date schedule, and at ε 1.5 XGB + PPO falls significantly below it (−0.28, Holm p 0.046). Double DQN overtakes PPO at ε 1.5.
+- The ensemble beats the mean of seeds on validation in every combination except rf PPO at ε 0.6 and 0.8, where both sit at 1.25× (exact ties).
+- **Robustness at ε 1.2 and 1.5:** the gain vs best fixed holds in the other ML world and with demand ±15% (+0.82 to +1.68 at ε 1.2, +1.79 to +2.85 at ε 1.5, every mean-of-seeds and ensemble row). Deployed at another ε, every run keeps its own price level and loses to a re-chosen best fixed, by up to 5.8% (ε 1.2 agents in the ε 0.8 world) and 10.9% (ε 1.5 agents in the ε 0.8 world).
+
 ### Robustness (`robustness.py`; every policy deployed unchanged)
 
-PPO mean of seeds, % vs best fixed at the nominal 1.15×:
+The ε 1.0 run; the other runs are in Agents trained at each elasticity. PPO mean of seeds, % vs best fixed at the nominal 1.15×:
 
 | World | Gain |
 |---|---|
@@ -232,7 +250,7 @@ PPO mean of seeds, % vs best fixed at the nominal 1.15×:
 | ε 0.8 | −0.26 / −0.22 (−1.70 / −1.74 vs the re-chosen 1.25×, the grid edge) |
 
 - **The day-by-day gain survives another world and demand ±15%:** +0.31 to +0.74% for every mean-of-seeds and ensemble row.
-- **Elasticity is the weak point.** Deployed unchanged, the agents keep their ε = 1 price level. At ε 0.8 they trail a re-chosen 1.25× by 1.1–1.8% (while still beating the hotel by 4.0–4.9%); at ε 1.2 Double DQN falls below the re-chosen 1.00× (−0.26 / −0.37%). Training across ε would address it (future work).
+- **Elasticity is the weak point.** Deployed unchanged, the agents keep their ε = 1 price level. At ε 0.8 they trail a re-chosen 1.25× by 1.1–1.8% (while still beating the hotel by 4.0–4.9%); at ε 1.2 Double DQN falls below the re-chosen 1.00× (−0.26 / −0.37%). Agents trained at the true ε don't have this problem (see Agents trained at each elasticity); training across ε would cover an unknown ε (future work).
 - The ensembles beat the mean of seeds in almost every world (the exceptions are within 0.07 points). The re-chosen best fixed rows equal `sensitivity.csv`.
 
 ### Where the level gain comes from, and its caveats
@@ -286,14 +304,14 @@ PPO mean of seeds, % vs best fixed at the nominal 1.15×:
 
 ### Elasticity
 
-Keep 1.0 as the main scenario. Per the hotel, its main competitor is usually 5–15% cheaper for this room type (sometimes more expensive), so ε well below 1 would imply implausible premiums; report about 0.8–1.5 as sensitivity.
+Keep 1.0 as the main scenario. Per the hotel, its main competitor is usually 5–15% cheaper for this room type (sometimes more expensive), so ε well below 1 would imply implausible premiums; report about 0.8–1.5 as sensitivity, with the agents trained at each ε (see Agents trained at each elasticity).
 
 Cross-file contracts: `bar_rates.py` imports `load_raw`, `file_hash`, `SEASONS`, `SUMMER`, `XLSX_PATH` and `BAR_DIR` from `ml_demand_model.py`, which in turn reads `bar_exports/bar_daily.csv` / `bar_bookings.csv` (`load_bar` fails loudly if they are missing, don't cover every booking, or `bar_inputs.sha256` no longer matches `BOOKINGS.xlsx` and the rate CSVs: re-run `bar_rates.py` after changing them or the load filters). `rl_agent.py` imports `PRICE_MULTIPLIERS` and `SIM_DATA_PATH` from the env, and `file_hash` from `ml_demand_model.py` inside `append_elasticity_log`, so worker processes don't load the ML stack. The env depends on the exact `sim_data.pkl` schema produced by `build_sim_data` (per season: `capacity`, `online_avail`, `dispersion_k`, `dates`, `lambda_true`, `lambda_forecast`, `hotel_price`, `p_ref`, calendar arrays, `profiles`, `actual`; top level: `seasons`, `models`). `actual` also holds the calibration targets `requests_var` and `sold_out_nights`. After changing that schema, `BOOKINGS.xlsx` or `hotel_pms_data.csv`, you must re-run `ml_demand_model.py`. `ml_demand_model.py` imports `HotelEnv` inside `simulate_hotel` to calibrate, and calibrates on the env's `info["recorded"]` and `info["room_nights"]`. Model keys `"rf"` / `"xgb"` are shared across the ML, env and RL files. `robustness.py` imports its evaluation helpers and constants from `rl_agent.py` (one implementation) and reads the elasticity log's `sim_data`, `results.csv` and the comparison CSV, so a change to `summarise`, `seed_se` or the result names makes its reproduction check fail. `ml_reference.py` imports the loaders and scoring from `ml_demand_model.py` and repeats `main`'s load filters; if those change, its `sim_data` guard fails. `pricing_tool.ipynb` imports from `rl_agent.py`, `robustness.py` and the env.
 
 ## Future and proposed work
 
-**Status (27 Oct 2026):**
-- The ML and RL code is frozen for the professors' review, and the 22 Oct run is final. Only printing changes are planned before the review; everything else below comes after it.
+**Status (29 Oct 2026):**
+- The ML and RL code is frozen for the professors' review, and the 22 Oct run is final. The 29 Oct clean rerun (BAR, ML, then RL at ε 0.6–1.5 with `robustness.py` for each, `ml_reference.py` and the notebook) reproduced it exactly. Only printing changes are planned before the review; everything else below comes after it.
 - The 27 Oct evaluation additions (`robustness.py`, `ml_reference.py`, `pricing_tool.ipynb`, the env's `demand_scale`) change no result.
 - Send the repo through git (a link or `git archive`), never as a zipped folder: a zip would include the private data and `sim_data.pkl`.
 
