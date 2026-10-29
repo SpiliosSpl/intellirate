@@ -7,6 +7,9 @@ schedule and a rooms-left rule, on the TEST seasons:
   tests against every baseline;
 - in perturbed worlds (the other ML model's world, other elasticities, demand
   scaled down or up), every policy deployed unchanged.
+It also writes, per ML model, the data of the run's figures (price path,
+learning curves) and per-date and rooms-left tables, one column per series,
+for drawing the thesis charts in Excel.
 The checkpoints must come from the current sim_data.pkl (the elasticity log's
 fingerprint). Reads existing files and writes only OUT_DIR."""
 import argparse
@@ -17,10 +20,11 @@ import numpy as np
 import pandas as pd
 import torch
 from scipy import stats
+from stable_baselines3.common.results_plotter import load_results, ts2xy
 
 from hotel_season_env import HotelEnv, PRICE_MULTIPLIERS, SIM_DATA_PATH
 from rl_agent import (ALGOS, MODELS, MODEL_NAMES, SEASON, ELASTICITY, TIMESTEPS, SEEDS,
-                      VAL_SEED0, N_VAL_FIXED, TEST_SEED0, N_TEST, PROTOCOL, ELASTICITY_LOG,
+                      VAL_SEED0, N_VAL, N_VAL_FIXED, TEST_SEED0, N_TEST, PROTOCOL, ELASTICITY_LOG,
                       run_policy, run_batched, make_envs, hotel_policy, fixed_policy,
                       schedule_policy, greedy, ensemble, summarise, seed_se, find_best_fixed,
                       action_sweep, best_schedule, observed_range, at_grid_edge, steps_tag)
@@ -174,15 +178,19 @@ def forecast_terciles(forecast):
     return pd.qcut(pd.Series(forecast).rank(method="first"), 3, labels=False).to_numpy()
 
 
-def recording(predict, counts, terciles, capacity):
+def recording(predict, counts, terciles, capacity, daily, left):
     """predict, also counting each day's (rooms left tonight, forecast tercile,
-    action) in counts. run_batched calls it once per day, so the counts come
-    from the rollout that is scored."""
+    action) in counts, each date's actions in daily (dates x actions) and its
+    rooms left, summed over the seasons, in left. run_batched calls it once
+    per day, so the counts come from the rollout that is scored."""
     day = [0]
 
     def wrapped(obs):
         actions = np.asarray(predict(obs))
-        np.add.at(counts, (rooms_left(obs, capacity), terciles[day[0]], actions), 1)
+        rooms = rooms_left(obs, capacity)
+        np.add.at(counts, (rooms, terciles[day[0]], actions), 1)
+        np.add.at(daily, (day[0], actions), 1)
+        left[day[0]] += rooms.sum()
         day[0] += 1
         return actions
     return wrapped
@@ -203,7 +211,10 @@ def sweep_task(model, args):
     return dict(best=best, best_in=find_best_fixed(env, actions=in_range)[0],
                 schedule=best_schedule(sweep, range(len(PRICE_MULTIPLIERS))),
                 schedule_in=best_schedule(sweep, in_range),
-                fixed_val=fixed_val["reward"].mean(), hotel_val=hotel_val["reward"].mean())
+                fixed_val=fixed_val["reward"].mean(), hotel_val=hotel_val["reward"].mean(),
+                # the learning curves' reference lines: the checkpoint seasons, as rl_agent
+                fixed_ckpt=fixed_val["reward"].iloc[:N_VAL].mean(),
+                hotel_ckpt=hotel_val["reward"].iloc[:N_VAL].mean())
 
 
 def rule_task(model, args):
@@ -219,27 +230,31 @@ def rule_task(model, args):
 def evaluate_world(model, world, bench, args):
     """Every policy of model's pipeline on the test seasons of world, deployed
     unchanged (bench: chosen in the nominal world). Returns the per-season
-    runs, the policy-map counts and the best fixed level re-chosen in world."""
+    runs, the price paths of season TEST_SEED0, the policy-map and per-date
+    counts and the best fixed level re-chosen in world."""
     torch.set_num_threads(1)
     kw = env_kwargs_for(model, world, args)
     env, envs = HotelEnv(**kw), make_envs(kw, N_TEST)
     terciles, cap, n_act = forecast_terciles(env.forecast), env.capacity, len(PRICE_MULTIPLIERS)
-    test = dict(n=N_TEST, seed0=TEST_SEED0)
-    runs, maps = {}, {}
+    test = dict(n=N_TEST, seed0=TEST_SEED0, record_path=True)
+    runs, paths, maps, daily, left = {}, {}, {}, {}, {}
 
-    runs["hotel"] = run_policy(env, hotel_policy, **test)[0]
-    runs["fixed"] = run_policy(env, fixed_policy(bench["best"]), **test)[0]
+    runs["hotel"], paths["hotel"] = run_policy(env, hotel_policy, **test)
+    runs["fixed"], paths["fixed"] = run_policy(env, fixed_policy(bench["best"]), **test)
     rechosen = bench["best"] if world == "nominal" else find_best_fixed(env)[0]
     runs["rechosen"] = runs["fixed"] if rechosen == bench["best"] else \
         run_policy(env, fixed_policy(rechosen), **test)[0]
-    runs["schedule"] = run_policy(env, schedule_policy(bench["schedule"]), **test)[0]
+    runs["schedule"], paths["schedule"] = run_policy(env, schedule_policy(bench["schedule"]), **test)
     if world == "nominal":
         runs["fixed_in"] = run_policy(env, fixed_policy(bench["best_in"]), **test)[0]
         runs["schedule_in"] = run_policy(env, schedule_policy(bench["schedule_in"]), **test)[0]
 
     def batched(key, predict):
         maps[key] = np.zeros((cap + 1, len(TERCILES), n_act), dtype=int)
-        runs[key] = run_batched(envs, recording(predict, maps[key], terciles, cap), TEST_SEED0)[0]
+        daily[key], left[key] = np.zeros((env.n_days, n_act), dtype=int), np.zeros(env.n_days, dtype=int)
+        runs[key], paths[key] = run_batched(
+            envs, recording(predict, maps[key], terciles, cap, daily[key], left[key]), TEST_SEED0,
+            record_path=True)
 
     batched("rule", rule_predict(bench["rule"], cap))
     folder = results_dir(model, args)
@@ -249,7 +264,8 @@ def evaluate_world(model, world, bench, args):
             batched((algo, s), greedy(agent))
         if with_ensemble(args.seeds):
             batched((algo, "ensemble"), ensemble(agents))
-    return dict(runs=runs, maps=maps, rechosen=rechosen, kwargs=kw)
+    return dict(runs=runs, paths=paths, maps=maps, daily=daily, left=left, rechosen=rechosen,
+                kwargs=kw)
 
 
 def run_tasks(jobs, tasks):
@@ -483,6 +499,107 @@ def per_season_rows(model, world, res, bench, args):
 
 
 # =============================================================================
+# FIGURE DATA (nominal world; a column named after a policy is its price in
+# EUR, or its revenue in the learning curves)
+# =============================================================================
+
+def calendar(env):
+    """The date columns of the per-date figure tables."""
+    dates = pd.DatetimeIndex(env.dates)
+    return {"date": dates, "weekday": dates.day_name().str[:3], "month": dates.month,
+            "holiday": env.holiday.astype(int), "Demand forecast (requests/day)": env.forecast,
+            "Offline rooms": env.offline}
+
+
+def observing(args):
+    """The policies that read the observation, each with the runs it pools: the
+    rule, and per algorithm the mean of seeds (every seed) and the ensemble."""
+    groups = [("rule", ["rule"])]
+    for algo in ALGOS:
+        groups.append(((algo, "mean"), [(algo, s) for s in args.seeds]))
+        if with_ensemble(args.seeds):
+            groups.append(((algo, "ensemble"), [(algo, "ensemble")]))
+    return groups
+
+
+def figure_name(bench, args):
+    name = names_of(bench, len(args.seeds))
+    return lambda key: "Hotel BAR" if key == "hotel" else name(key)
+
+
+def price_path_table(res, bench, env, args):
+    """rl_agent's price_path.png as data: test season TEST_SEED0, whose agent
+    lines are the first seed's; here with the benchmarks and the ensembles.
+    Per policy, the price and the rooms occupied tonight after that day's
+    bookings (offline stays included)."""
+    name, paths = figure_name(bench, args), res["paths"]
+    keys = ["hotel", "fixed", "schedule", "rule"]
+    for algo in ALGOS:
+        keys += [(algo, args.seeds[0])] + ([(algo, "ensemble")] if with_ensemble(args.seeds) else [])
+    out = calendar(env)
+    out.update({name(k): paths[k]["price"].to_numpy() for k in keys})
+    out.update({f"{name(k)} occupied rooms": paths[k]["occupied"].to_numpy() for k in keys})
+    return pd.DataFrame(out)
+
+
+def per_date_table(res, bench, env, args):
+    """Per date, over the test seasons: the hotel's, best fixed's and the
+    schedule's price (the same every season), and each observing policy's
+    mean price and mean rooms left tonight when it prices."""
+    name = figure_name(bench, args)
+    out = calendar(env)
+    out[name("hotel")] = env.hotel_price
+    out[name("fixed")] = np.full(env.n_days, env.prices[bench["best"]])
+    out[name("schedule")] = env.prices[bench["schedule"]]
+    for key, keys in observing(args):
+        counts = sum(res["daily"][k] for k in keys)                    # dates x actions
+        days = counts.sum(axis=1)
+        out[name(key)] = counts @ env.prices / days
+        out[f"{name(key)} rooms left"] = sum(res["left"][k] for k in keys) / days
+    return pd.DataFrame(out)
+
+
+def capacity_curve_table(res, bench, env, args):
+    """Per number of rooms left tonight when pricing, over the test seasons:
+    each observing policy's mean price and multiplier and its days there
+    (blank where it never was). The policy-map counts, all forecasts together."""
+    name = figure_name(bench, args)
+    out = {"rooms_left": np.arange(env.capacity + 1)}
+    for key, keys in observing(args):
+        counts = sum(res["maps"][k] for k in keys).sum(axis=1)         # rooms left x actions
+        days = counts.sum(axis=1)
+        mean = np.where(days > 0, counts @ np.array(PRICE_MULTIPLIERS) / np.maximum(days, 1), np.nan)
+        out.update({name(key): mean * env.p_ref, f"{name(key)} multiplier": mean,
+                    f"{name(key)} days": days})
+    return pd.DataFrame(out)
+
+
+def learning_curve_tables(model, bench, args):
+    """rl_agent's learning_curve_<algo>.png as data, every algorithm side by
+    side: (training, validation). Training: each seed's episode revenue,
+    smoothed as plot_learning smooths it. Validation: the greedy policy on the
+    checkpoint seasons, with the selected checkpoint (the star) in its own
+    column. Both with the hotel and best fixed on the checkpoint seasons."""
+    folder = results_dir(model, args)
+    curves = pd.read_csv(os.path.join(folder, "validation_curve.csv"), float_precision="round_trip")
+    steps = pd.read_csv(os.path.join(folder, "results.csv"),
+                        float_precision="round_trip").set_index("policy")["checkpoint_step"]
+    train, val = [], []
+    for algo, (_, _, algo_name) in ALGOS.items():
+        for s in args.seeds:
+            label = f"{algo_name} seed {s}"
+            x, y = ts2xy(load_results(os.path.join(folder, f"logs_{algo}_seed{s}")), "timesteps")
+            w = max(1, len(y) // 30)                                     # as plot_learning
+            train.append(pd.Series(np.convolve(y, np.ones(w) / w, mode="valid"), index=x[w - 1:],
+                                   name=label))
+            c = curves[(curves["algo"] == algo) & (curves["seed"] == s)].set_index("timesteps")["val_reward"]
+            val += [c.rename(label), c.where(c.index == steps[label]).rename(f"{label} selected")]
+    refs = {"Hotel (actual prices)": bench["hotel_ckpt"], "Best fixed price": bench["fixed_ckpt"]}
+    return [pd.concat(series, axis=1).sort_index().rename_axis("timesteps").reset_index().assign(**refs)
+            for series in (train, val)]
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -553,7 +670,8 @@ def report(bench, res, log_rows, args):
             run = seed_runs(runs, key[0], args.seeds) if isinstance(key, tuple) and key[1] == "mean" \
                 else runs[key]
             gain, se, ci = compare(run, fixed)
-            base_rows.append({"forecaster": m, **{c: v for c, v in r.items() if c != "val_vs_hotel_%"},
+            base_rows.append({"season": args.season, "elasticity": args.elasticity, "forecaster": m,
+                              **{c: v for c, v in r.items() if c != "val_vs_hotel_%"},
                               "vs_best_fixed_%": gain, "vs_best_fixed_se_%": se,
                               "vs_best_fixed_ci95_%": ci, "val_vs_hotel_%": r.get("val_vs_hotel_%")})
 
@@ -629,8 +747,20 @@ def report(bench, res, log_rows, args):
         .to_csv(os.path.join(out_dir, "policy_map.csv"), index=False)
     pd.concat([per_season_rows(m, w, x, bench[m], args) for (m, w), x in res.items()]) \
         .to_csv(os.path.join(out_dir, "per_season.csv"), index=False)
+
+    # 5. Figure data, per ML model (nominal world)
+    for m in args.models:
+        env, x, b = HotelEnv(**env_kwargs_for(m, "nominal", args)), res[m, "nominal"], bench[m]
+        save = lambda df, f: df.to_csv(os.path.join(out_dir, f"{f}_{m}.csv"), index=False)
+        save(price_path_table(x, b, env, args), "price_path")
+        save(per_date_table(x, b, env, args), "per_date")
+        save(capacity_curve_table(x, b, env, args), "capacity_curve")
+        train, val = learning_curve_tables(m, b, args)
+        save(train, "learning_curve_train")
+        save(val, "learning_curve_val")
     out(f"Saved {out_dir}/: baselines.csv, significance.csv, robustness.csv, policy_map.csv, "
-        "rooms_left_rule.csv, per_season.csv, reproduction.csv, summary.txt")
+        "rooms_left_rule.csv, per_season.csv, reproduction.csv, summary.txt; figure data per ML "
+        "model: price_path, per_date, capacity_curve, learning_curve_train / _val (_<model>.csv)")
     with open(os.path.join(out_dir, "summary.txt"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(log))
 

@@ -27,7 +27,7 @@ Evaluation only (no training; they read existing outputs and write only their ow
 
 ```
 python ml_reference.py         # same inputs as ml_demand_model.py -> ml_reference/: ml_table.csv (ml_comparison.csv + GLM / Ridge reference rows), ml_reference_comparison.csv, ml_reference_cv_grid.csv, summary.txt
-python robustness.py           # a finished run's checkpoints + sim_data.pkl -> robustness_<season>_e<elasticity>_t<steps>/: baselines.csv, significance.csv, robustness.csv, policy_map.csv, rooms_left_rule.csv, per_season.csv, reproduction.csv, summary.txt (about 9 min with --jobs 6, the default)
+python robustness.py           # a finished run's checkpoints + sim_data.pkl -> robustness_<season>_e<elasticity>_t<steps>/: baselines.csv, significance.csv, robustness.csv, policy_map.csv, rooms_left_rule.csv, per_season.csv, reproduction.csv, summary.txt, + figure data per ML model (about 9 min with --jobs 6, the default)
 ```
 
 Nothing runs them automatically: after an ML rerun, rerun `ml_reference.py`; after an RL run, rerun `robustness.py` (it refuses checkpoints from another world) and re-run and save the notebook below.
@@ -141,13 +141,18 @@ There are four files, forming one pipeline: **BAR reconstruction → ML demand m
    - **Worlds (`WORLDS`, every policy deployed unchanged):** nominal, the other ML world (own forecast kept), ε 0.8 / 1.2, demand ×0.85 / ×1.15. Best fixed is reported at the nominal level and re-chosen on validation per world (an upper reference).
    - **Significance:** paired over the 200 test seasons. Mean of seeds: `seed_se`, t(n−1); seeds and ensembles: z, descriptive. Holm (FWER 5%) over the primary family: mean of seeds × algorithm × ML model × {hotel, best fixed, schedule, rule}.
    - **Outputs:**
-     - `baselines.csv`: the thesis table;
+     - `baselines.csv`: the thesis table, with `season` and `elasticity` columns so the runs' tables stack;
      - `significance.csv`;
      - `robustness.csv`;
      - `policy_map.csv`: multiplier by rooms left tonight and forecast tercile, tidy;
      - `rooms_left_rule.csv`;
      - `per_season.csv`: the raw data behind every number;
      - `reproduction.csv` and `summary.txt`.
+     - **Figure data** for Excel, per ML model (`<name>_<model>.csv`, nominal world). They have one column per series, and a column named after a policy is its price in EUR (its revenue in the learning curves):
+       - `price_path`: the season of `price_path.png` (test seed 500000), with the benchmarks, the rule and the ensembles added;
+       - `per_date`: each policy's mean price and rooms left per date over the test seasons;
+       - `capacity_curve`: mean price and multiplier by rooms left tonight;
+       - `learning_curve_train` / `learning_curve_val`: the data of `learning_curve_<algo>.png`, reference lines and selected checkpoints included.
 
      `--jobs 1` and the default `--jobs 6` give identical files.
 
